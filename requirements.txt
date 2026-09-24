@@ -1,0 +1,8 @@
+nicegui
+pyalex
+pandas
+openpyxl
+requests
+pyinstaller
+xlsxwriter
+reportlab

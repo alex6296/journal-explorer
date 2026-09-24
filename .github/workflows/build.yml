@@ -1,0 +1,21 @@
+# Builds the app for Windows AND Mac on GitHub's free build machines (PyInstaller cannot cross-compile,
+# so each OS has to be built on that OS). Run it from the repo's "Actions" tab -> "Build" -> "Run workflow",
+# then download the two zips from the finished run's "Artifacts" section.
+name: Build
+on: workflow_dispatch
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: nicegui-pack --onefile --name JournalExplorer journal_explorer.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JournalExplorer-${{ matrix.os }}
+          path: dist/*

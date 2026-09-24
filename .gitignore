@@ -1,0 +1,20 @@
+# Downloaded data and generated files - every user pulls their own
+data/
+Journals.xlsx
+Explore_papers_*.pdf
+*.building-*
+
+# Build output
+build/
+dist/
+*.spec
+send/
+share/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+*.log
