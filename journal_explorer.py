@@ -349,22 +349,26 @@ def sheet_names() -> dict[str, str]:
     return out
 
 
-def top_keywords(n: int = 25) -> list[str]:
-    """The n most used keywords over all downloaded journals (one count per paper)."""
-    kw = pd.concat([pd.read_pickle(pkl(j))["DE"] for j in CONFIG["journals"] if pkl(j).exists()]).dropna()
+def top_keywords(frames: list[pd.DataFrame], n: int = 25) -> list[str]:
+    """The n most used keywords in the given journal tables (one count per paper)."""
+    kw = pd.concat([f["DE"] for f in frames]).dropna()
     return kw.str.split("; ").explode().str.strip().value_counts().head(n).index.tolist()
 
 
-def export_excel() -> Path:
-    """Write Journals.xlsx. It is built in a temporary file and only moved into place once EVERYTHING succeeded,
+def export_excel(selection: pd.DataFrame | None = None) -> Path:
+    """Write Journals.xlsx - or, given a `selection` of papers (the Explore tab), the SAME workbook containing only those
+    papers, saved as Explore_papers_<time>.xlsx with an extra 'Filters' sheet saying how they were chosen.
+    It is built in a temporary file and only moved into place once EVERYTHING succeeded,
     so a failure part-way can never leave a half-written (corrupt) Journals.xlsx behind.
     xlsxwriter is used because it can store the *calculated* value next to every formula: the Summary then shows its
     numbers even where Excel does not recalculate (Protected View, previewers, Mac Quick Look)."""
     # Two exports writing the same file at once produce a damaged zip that Excel calls "corrupt" - so only one may run.
     if not EXPORT_LOCK.acquire(blocking=False):
         raise RuntimeError("An export is already running - please wait for it to finish.")
-    tmp = EXCEL_FILE.with_name(f"{EXCEL_FILE.stem}.building-{uuid.uuid4().hex[:8]}.xlsx")
+    target = EXCEL_FILE if selection is None else APP_DIR / f"Explore_papers_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    tmp = target.with_name(f"{target.stem}.building-{uuid.uuid4().hex[:8]}.xlsx")
     names = sheet_names()
+    keep = None if selection is None else set(selection["OpenAlexID"].fillna(selection["DI"]))   # one id per paper
     try:
         # strings_to_formulas / strings_to_urls off: otherwise text starting "=" or looking like a link (every DOI URL!)
         # is turned into a formula / hyperlink, and Excel refuses files with too many hyperlinks.
@@ -372,13 +376,27 @@ def export_excel() -> Path:
                             engine_kwargs={"options": {"strings_to_formulas": False, "strings_to_urls": False}}) as xl:
             book = xl.book
             summary = book.add_worksheet("Summary")                      # created first, so it is the first tab
+            if selection is not None:                                    # how this selection was made
+                info = book.add_worksheet("Filters")
+                lines = describe_filters()
+                info.write(0, 0, "Papers selected in Journal Explorer")
+                info.write(1, 0, f"{len(selection):,} papers - created {datetime.now():%Y-%m-%d %H:%M}")
+                for r, line in enumerate(lines, start=3):
+                    info.write(r, 0, line)
+                info.write(len(lines) + 4, 0, "Data: OpenAlex + Crossref - see 'About this data' in the app.")
+                info.set_column(0, 0, 110)
             fills = {c: book.add_format({"bg_color": "#" + col}) for c, col in
                      {"\u2705": "C6EFCE", "\u26a0": "FFEB9C", "other": "EDEDED"}.items()}
             data = []                                                    # (journal, sheet name, table) for the Summary
             for j in CONFIG["journals"]:
                 if not pkl(j).exists():
                     continue
-                df = pd.read_pickle(pkl(j))[WOS_COLUMNS + EXTRA_COLUMNS].map(clean_cell)
+                raw = pd.read_pickle(pkl(j))[WOS_COLUMNS + EXTRA_COLUMNS]
+                if keep is not None:                                     # only the selected papers
+                    raw = raw[raw["OpenAlexID"].fillna(raw["DI"]).isin(keep)]
+                    if raw.empty:
+                        continue
+                df = raw.map(clean_cell)
                 sh = names[j["abbr"]]
                 df.to_excel(xl, sheet_name=sh, index=False)
                 ws = xl.sheets[sh]
@@ -396,7 +414,7 @@ def export_excel() -> Path:
                                 "Scopus / Web of Science - see 'About this data' in the app.")
             summary.write("B4", "No of articles")
             summary.write("B5", "Keywords (the most used ones; type over any of them or use the empty rows)")
-            keywords = top_keywords(25) + [""] * 5                       # last rows are free for your own keywords
+            keywords = top_keywords([df for _, _, df in data]) + [""] * 5  # last rows are free for your own keywords
             for r, kw in enumerate(keywords, start=6):
                 summary.write(r - 1, 1, kw)
             for i, (j, sh, df) in enumerate(data):
@@ -413,11 +431,11 @@ def export_excel() -> Path:
                         hits = int(text.str.contains(kw.lower(), regex=False).sum()) if kw else 0
                         summary.write_formula(r - 1, c0 + k, f'=COUNTIF({q}!${letter}:${letter},"*"&Summary!$B{r}&"*")', None, hits)
             summary.set_column(1, 1, 38)
-        tmp.replace(EXCEL_FILE)                                          # only now does the real file change
+        tmp.replace(target)                                              # only now does the real file change
     finally:
         tmp.unlink(missing_ok=True)                                      # never leave the temp file behind
         EXPORT_LOCK.release()
-    return EXCEL_FILE
+    return target
 
 
 # ----------------------------------------------------------------------------------------------
@@ -786,6 +804,22 @@ def main_page():
         ui.download(path)
         ui.notify(f"Saved {path}", type="positive")
 
+    async def do_selection_excel():
+        d = filtered()
+        if d.empty:
+            ui.notify("No papers to export - the filters leave nothing.", type="warning")
+            return
+        note = ui.notification("Building the Excel file...", spinner=True, timeout=None)
+        try:
+            path = await run.io_bound(export_excel, d)
+        except Exception as e:
+            note.dismiss()
+            ui.notify(f"Excel export failed: {e}", type="negative", multi_line=True, close_button=True, timeout=0)
+            return
+        note.dismiss()
+        ui.download(path)
+        ui.notify(f"Saved {path}", type="positive")
+
     # =============================== chain filters (AND / OR / AND NOT, any length) ===============================
     def cycle_op(c: dict):
         c["op"] = OPS[(OPS.index(c["op"]) + 1) % len(OPS)]
@@ -952,7 +986,8 @@ def main_page():
                 ui.label("Pick your words").classes("text-h4")
                 ui.space()
                 ui.label(f"{len(d):,} papers match").classes("text-h6")
-                ui.button("Export these papers to PDF", icon="picture_as_pdf", on_click=do_pdf).props("unelevated no-caps color=white text-color=primary")
+                ui.button("Export these papers to Excel", icon="table_view", on_click=do_selection_excel).props("unelevated no-caps color=white text-color=primary")
+                ui.button("PDF", icon="picture_as_pdf", on_click=do_pdf).props("unelevated no-caps color=white text-color=primary")
                 ui.checkbox("with abstracts", value=EX["pdf_abs"], on_change=lambda e: EX.update(pdf_abs=e.value)).props("dark")
             # --- what you have picked ---
             with ui.row().classes("items-center gap-2"):

@@ -19,8 +19,8 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   authors, keywords, abstract) take an **AND / OR / AND NOT chain of any length**, editable in a pop-up list.
 - **Explore tab:** a keyword "slot machine" for finding ideas. Lock a keyword, shuffle to get 10 keywords from papers that
   also have it, lock another, and so on. Charts show the locked keywords over time and the most common other keywords.
-  **Export the papers left after all filters to a PDF.**
-- **Export to Excel** in the layout of a Web of Science export: one sheet per journal with the same column tags, and a
+  **Export the papers left after all filters to Excel** (same workbook layout as the full export, plus a Filters sheet) **or PDF.**
+- **Export to Excel** (header button = everything you downloaded) in the layout of a Web of Science export: one sheet per journal with the same column tags, and a
   Summary sheet with keyword counts.
 
 ## Run it
