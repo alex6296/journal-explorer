@@ -715,6 +715,7 @@ def main_page():
     def refresh_views():
         """Redraw whatever is on screen after a filter changed (only the visible tab, to stay quick)."""
         chain_chips.refresh()
+        chain_buttons.refresh()
         if ACTIVE["tab"] == "Papers":
             papers.refresh()
         elif ACTIVE["tab"] == "Explore":
@@ -734,7 +735,7 @@ def main_page():
         if was_full:
             STATE["years"] = {"min": YB[0], "max": YB[1]}
         EX["dirty"] = True
-        empty_state.refresh(); filters.refresh(); journals_panel.refresh(); refresh_views()
+        empty_state.refresh(); filters.refresh(); papers_filters.refresh(); journals_panel.refresh(); refresh_views()
 
     # =============================== full-screen download overlay ===============================
     with ui.dialog().props("persistent maximized") as dl_dialog:
@@ -917,6 +918,47 @@ def main_page():
                 for field in CHAIN_LABELS:
                     if show_keywords or field != "keywords":
                         chain_widget(field)
+
+    # =============================== Papers tab filters: as they always were ===============================
+    @ui.refreshable
+    def papers_filters():
+        """Search, journals, confidence and paper types - the original Papers tab controls (shared state, so what you set
+        in Explore shows here too)."""
+        with ui.row().classes("items-center gap-4 w-full"):
+            ui.input("Search title, abstract, keywords", value=STATE["q"], on_change=lambda e: (STATE.update(q=e.value or ""), changed())
+                     ).props("clearable outlined dense debounce=400").classes("w-96")
+            ui.select({j["abbr"]: j["name"] for j in CONFIG["journals"]}, multiple=True, value=sorted(STATE["journals"]),
+                      label="Journals (all)", on_change=lambda e: (STATE.update(journals=set(e.value)), changed())
+                      ).props("outlined dense use-chips").classes("w-72")
+        ui.select({"": "All records", "\u2705": "\u2705 Both sources agree", "\u26a0": "\u26a0\ufe0f Sources conflict",
+                   "\u25fb": "\u25fb Only one source"}, value=STATE["check"], label="Confidence",
+                  on_change=lambda e: (STATE.update(check=e.value), changed())).props("outlined dense").classes("w-56")
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Show:").classes("text-caption")
+            for t in DOC_TYPES:
+                def toggle(e, t=t):
+                    STATE["types"].add(t) if e.value else STATE["types"].discard(t)
+                    changed()
+                ui.checkbox(t, value=t in STATE["types"], on_change=toggle)
+
+    def reset_years():
+        STATE["years"] = {"min": YB[0], "max": YB[1]}
+        filters.refresh()
+        changed()
+
+    @ui.refreshable
+    def chain_buttons():
+        """One button per text field. Conditions (AND / OR / AND NOT, any number) are written and edited in the pop-up,
+        so nothing grows on the page. The number shows how many conditions are active."""
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Conditions:").classes("text-caption")
+            for field, label in CHAIN_LABELS.items():
+                n = len([c for c in STATE["chains"][field] if c["text"].strip()])
+                ui.button(label + (f"  ({n})" if n else ""), icon="tune", on_click=lambda f=field: open_chain_modal(f)).props(
+                    "outline no-caps dense " + ("color=primary" if n else "color=grey-7"))
+            if (STATE["years"]["min"], STATE["years"]["max"]) != YB:   # a years range set in Explore also applies here
+                ui.button(f'Years {STATE["years"]["min"]}-{STATE["years"]["max"]}  \u2715', on_click=reset_years).props(
+                    "outline no-caps dense color=amber-9").tooltip("Set in the Explore tab - click to clear")
 
     # =============================== the paper detail dialog ===============================
     def show_paper(r: dict):
@@ -1125,7 +1167,7 @@ def main_page():
     def on_tab(e):
         ACTIVE["tab"] = e.value
         EX["dirty"] = True
-        filters.refresh()                                         # both filter cards re-read the shared state
+        filters.refresh(); papers_filters.refresh()               # both tabs re-read the shared state
         refresh_views()
 
     with ui.tabs().classes("w-full") as tabs:
@@ -1135,7 +1177,8 @@ def main_page():
 
     with ui.tab_panels(tabs, value="Papers", on_change=on_tab).classes("w-full").style("background: transparent"):
         with ui.tab_panel("Papers"):
-            filters(True)
+            papers_filters()
+            chain_buttons()
             papers()
 
         with ui.tab_panel("Explore"):
