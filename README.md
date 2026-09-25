@@ -26,9 +26,9 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
 
 ## Run it
 
-**Windows, no install:** build the exe once (below) or use one from the Releases page if there is one, then double-click
-`JournalExplorer.exe`. Press **Download papers** on first start. Windows may show "More info -> Run anyway" because the
-exe is not code-signed.
+**Windows, no install:** download [`JournalExplorer.exe`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer.exe)
+(it is in the root of this repository, 79 MB) and double-click it. Press **Download papers** on first start. Windows may show
+"More info -> Run anyway" because the exe is not code-signed. The exe is rebuilt by hand, so it can lag behind the source.
 
 **From source** (Windows, Mac or Linux, Python 3.11+):
 
