@@ -507,7 +507,23 @@ For anything that will be published or used for a decision, verify a sample agai
 CONFIG = load_config()
 DF = load_all()                       # the table the viewer shows; reloaded after every download
 N_PICKS = 10                          # how many keywords the slot machine shows at once
-OPS = ["AND", "OR", "AND NOT"]        # how a term is joined to the ones before it
+OPS = ["AND", "OR"]                   # how a condition is joined to the ones before it
+# What each condition tests - the same operators as the grid's own column filter, but as many conditions as you like.
+CONDS = {"contains": "Contains", "not_contains": "Does not contain", "equals": "Equals", "not_equals": "Does not equal",
+         "begins": "Begins with", "ends": "Ends with", "blank": "Blank", "not_blank": "Not blank"}
+NO_TEXT = ("blank", "not_blank")      # these two need no text
+COND_PREFIX = {"contains": "", "not_contains": "NOT ", "equals": "= ", "not_equals": "\u2260 ", "begins": "starts with ",
+               "ends": "ends with ", "blank": "(blank)", "not_blank": "(not blank)"}
+
+
+def active_terms(chain: list[dict]) -> list[dict]:
+    """Conditions that actually filter something (a condition with no text yet is ignored, except Blank / Not blank)."""
+    return [c for c in chain if c.get("text", "").strip() or c.get("cond") in NO_TEXT]
+
+
+def term_label(c: dict) -> str:
+    """A condition as short text, for the chips, the PDF and the Filters sheet."""
+    return COND_PREFIX[c.get("cond", "contains")] + ("" if c.get("cond") in NO_TEXT else c["text"])
 CHAIN_LABELS = {"keywords": "Keywords", "title": "Title", "authors": "Authors", "abstract": "Abstract"}
 
 
@@ -520,7 +536,7 @@ def year_bounds() -> tuple[int, int]:
 YB = year_bounds()
 
 # ONE shared filter state: the Papers tab, the Explore tab, the charts and the pop-up editors all read and write this,
-# so they can never disagree. "chains" hold the AND / OR / AND NOT term lists (as long as you like) per text field.
+# so they can never disagree. "chains" hold the conditions (joined by AND / OR, as many as you like) per text field.
 STATE = {"types": set(DEFAULT_ON), "journals": set(), "check": "", "q": "", "years": {"min": YB[0], "max": YB[1]},
          "chains": {f: [] for f in CHAIN_LABELS},
          "busy": False, "error": "", "started": 0.0, "jobs": {}}
@@ -528,27 +544,48 @@ STATE = {"types": set(DEFAULT_ON), "journals": set(), "check": "", "q": "", "yea
 EX = {"picks": [], "dirty": True, "surprise": 0.6, "min_papers": 2, "next_op": "AND", "chart_mode": "count", "kw_mode": "most", "pdf_abs": True}
 
 
-def term_mask(d: pd.DataFrame, field: str, text: str) -> pd.Series:
-    """Which papers contain one term. Keywords: an exact keyword when the term is a known one (so 'Process' does not
-    also match 'Process management'), otherwise a partial match. Title / authors / abstract: partial match."""
-    t = text.strip().lower()
+def term_mask(d: pd.DataFrame, field: str, text: str, cond: str = "contains") -> pd.Series:
+    """Which papers meet ONE condition. Keywords are a list per paper: 'Equals' means one of the keywords is exactly the
+    text; 'Contains' uses an exact keyword when the text is a known one (so 'Process' does not also match
+    'Process management'), otherwise a partial match. Title / authors / abstract are plain text."""
+    t = (text or "").strip().lower()
+    base = {"not_contains": "contains", "not_equals": "equals", "not_blank": "blank"}.get(cond, cond)
     if field == "keywords":
-        if t in VOCAB:
-            return d["_kwl"].map(lambda s: t in s)
-        return d["_kwtext"].str.contains(t, regex=False)
-    return d[{"title": "_ti", "authors": "_au", "abstract": "_ab"}[field]].str.contains(t, regex=False)
+        sets = d["_kwl"]
+        if base == "contains":
+            m = sets.map(lambda s: t in s) if t in VOCAB else d["_kwtext"].str.contains(t, regex=False)
+        elif base == "equals":
+            m = sets.map(lambda s: t in s)
+        elif base == "begins":
+            m = sets.map(lambda s: any(k.startswith(t) for k in s))
+        elif base == "ends":
+            m = sets.map(lambda s: any(k.endswith(t) for k in s))
+        else:                                                    # blank
+            m = sets.map(len) == 0
+    else:
+        col = d[{"title": "_ti", "authors": "_au", "abstract": "_ab"}[field]]
+        if base == "contains":
+            m = col.str.contains(t, regex=False)
+        elif base == "equals":
+            m = col.str.strip() == t
+        elif base == "begins":
+            m = col.str.startswith(t)
+        elif base == "ends":
+            m = col.str.endswith(t)
+        else:                                                    # blank
+            m = col.str.strip() == ""
+    return ~m if cond in ("not_contains", "not_equals", "not_blank") else m
 
 
 def chain_mask(d: pd.DataFrame, field: str, chain: list[dict]):
-    """Evaluate 'a AND b OR c AND NOT d' (AND binds tighter than OR, like everywhere else). None when the chain is empty."""
-    chain = [c for c in chain if c["text"].strip()]
+    """Evaluate 'a AND b OR c AND d' (AND binds tighter than OR, like everywhere else); each 'a' is one condition.
+    None when there are no active conditions."""
+    chain = active_terms(chain)
     if not chain or d.empty:
         return None
     groups, cur = [], None
     for i, c in enumerate(chain):
-        m = term_mask(d, field, c["text"]).to_numpy()
-        if c["op"] == "AND NOT":
-            m = ~m
+        m = term_mask(d, field, c.get("text", ""), c.get("cond", "contains")).to_numpy()
         if i == 0 or c["op"] == "OR":                            # an OR starts a new group
             if cur is not None:
                 groups.append(cur)
@@ -590,9 +627,9 @@ def describe_filters() -> list[str]:
     """The active filters as readable lines - printed on the first page of the PDF so it explains itself."""
     lines = []
     for field, chain in STATE["chains"].items():
-        chain = [c for c in chain if c["text"].strip()]
+        chain = active_terms(chain)
         if chain:
-            txt = "".join((("NOT " if c["op"] == "AND NOT" else "") if i == 0 else f" {c['op']} ") + c["text"] for i, c in enumerate(chain))
+            txt = "".join(("" if i == 0 else f" {c['op']} ") + term_label(c) for i, c in enumerate(chain))
             lines.append(f"{CHAIN_LABELS[field]}: {txt}")
     if STATE["journals"]:
         lines.append("Journals: " + ", ".join(sorted(STATE["journals"])))
@@ -823,18 +860,21 @@ def main_page():
 
     # =============================== chain filters (AND / OR / AND NOT, any length) ===============================
     def cycle_op(c: dict):
-        c["op"] = OPS[(OPS.index(c["op"]) + 1) % len(OPS)]
+        c["op"] = OPS[(OPS.index(c["op"]) + 1) % len(OPS)]              # AND <-> OR
         changed()
 
     def remove_term(field: str, i: int):
         STATE["chains"][field].pop(i)
         changed()
 
-    def add_term(field: str, text: str, op: str | None = None):
+    def add_term(field: str, text: str, op: str | None = None, cond: str = "contains"):
         text = (text or "").strip()
-        if text:
-            STATE["chains"][field].append({"op": (op or "AND") if STATE["chains"][field] else "AND", "text": text})
-            changed()
+        if not text and cond not in NO_TEXT:
+            return
+        if op == "AND NOT":                                       # the picker's "NOT" = AND + "Does not contain"
+            op, cond = "AND", "not_contains"
+        STATE["chains"][field].append({"op": (op or "AND") if STATE["chains"][field] else "AND", "cond": cond, "text": text})
+        changed()
 
     def render_chain(field: str, big: bool = False):
         """The terms of one chain as buttons: click the AND/OR word to switch it, click a term to remove it."""
@@ -842,8 +882,7 @@ def main_page():
         for i, c in enumerate(STATE["chains"][field]):
             if i > 0:
                 ui.button(c["op"], on_click=lambda c=c: cycle_op(c)).props(f"flat dense no-caps {size}" + (" color=white" if big else ""))
-            label = ("NOT " if i == 0 and c["op"] == "AND NOT" else "") + c["text"]
-            ui.button(f"{label}  ✕", on_click=lambda f=field, i=i: remove_term(f, i)).props(
+            ui.button(f"{term_label(c)}  ✕", on_click=lambda f=field, i=i: remove_term(f, i)).props(
                 "unelevated no-caps rounded color=amber-8 text-color=black " + size if big else f"outline no-caps rounded dense {size}")
 
     @ui.refreshable
@@ -855,24 +894,31 @@ def main_page():
         chain = STATE["chains"][field]
         modal_host.clear()
         with modal_host, ui.dialog() as dlg, ui.card().classes("w-[680px] max-w-full"):
-            ui.label(f"{CHAIN_LABELS[field]} filter").classes("text-h6")
-            ui.label("Terms are joined left to right; AND binds tighter than OR. Changes apply immediately.").classes("text-caption")
+            ui.label(f"{CHAIN_LABELS[field]} conditions").classes("text-h6")
+            ui.label("Add as many conditions as you like. AND binds tighter than OR. Changes apply immediately.").classes("text-caption")
 
             @ui.refreshable
             def rows():
                 with ui.column().classes("w-full gap-1"):
                     for i, c in enumerate(chain):
                         with ui.row().classes("items-center w-full no-wrap"):
-                            opts = {"AND": "start", "AND NOT": "NOT"} if i == 0 else {o: o for o in OPS}
-                            ui.select(opts, value=c["op"], on_change=lambda e, c=c: (c.update(op=e.value), changed())).props("dense outlined").classes("w-28")
-                            ui.input(value=c["text"], on_change=lambda e, c=c: (c.update(text=e.value or ""), changed())).props(
-                                "dense outlined debounce=500").classes("grow")
+                            if i == 0:
+                                ui.label("where").classes("w-20 text-caption text-center")
+                            else:
+                                ui.select(OPS, value=c["op"], on_change=lambda e, c=c: (c.update(op=e.value), changed())).props("dense outlined").classes("w-24")
+                            ui.select(CONDS, value=c.get("cond", "contains"),
+                                      on_change=lambda e, c=c: (c.update(cond=e.value), rows.refresh(), changed())).props("dense outlined").classes("w-48")
+                            if c.get("cond", "contains") in NO_TEXT:
+                                ui.label("(no text needed)").classes("grow text-caption")
+                            else:
+                                ui.input(value=c["text"], on_change=lambda e, c=c: (c.update(text=e.value or ""), changed())).props(
+                                    "dense outlined debounce=500").classes("grow")
                             ui.button(icon="delete", on_click=lambda i=i: (chain.pop(i), rows.refresh(), changed())).props("flat round color=negative")
                     if not chain:
                         ui.label("No terms yet.").classes("text-caption")
             rows()
             with ui.row():
-                ui.button("Add term", icon="add", on_click=lambda: (chain.append({"op": "AND", "text": ""}), rows.refresh())).props("flat")
+                ui.button("Add term", icon="add", on_click=lambda: (chain.append({"op": "AND", "cond": "contains", "text": ""}), rows.refresh())).props("flat")
                 ui.button("Clear all", on_click=lambda: (chain.clear(), rows.refresh(), changed())).props("flat color=negative")
                 ui.button("Done", on_click=dlg.close).props("color=primary")
         dlg.open()
@@ -948,12 +994,12 @@ def main_page():
 
     @ui.refreshable
     def chain_buttons():
-        """One button per text field. Conditions (AND / OR / AND NOT, any number) are written and edited in the pop-up,
+        """One button per text field. Conditions (Contains, Equals, Begins with ... joined by AND / OR, any number) are edited in the pop-up,
         so nothing grows on the page. The number shows how many conditions are active."""
         with ui.row().classes("items-center gap-2"):
             ui.label("Conditions:").classes("text-caption")
             for field, label in CHAIN_LABELS.items():
-                n = len([c for c in STATE["chains"][field] if c["text"].strip()])
+                n = len(active_terms(STATE["chains"][field]))
                 ui.button(label + (f"  ({n})" if n else ""), icon="tune", on_click=lambda f=field: open_chain_modal(f)).props(
                     "outline no-caps dense " + ("color=primary" if n else "color=grey-7"))
             if (STATE["years"]["min"], STATE["years"]["max"]) != YB:   # a years range set in Explore also applies here
@@ -1071,7 +1117,7 @@ def main_page():
         d0 = filtered(skip=("keywords",))                          # everything except the keyword chain
         if d0.empty:
             return
-        chain = [c for c in STATE["chains"]["keywords"] if c["text"].strip()]
+        chain = active_terms(STATE["chains"]["keywords"])
         year = pd.to_numeric(d0["PY"], errors="coerce")
         if year.dropna().empty:
             return
@@ -1085,7 +1131,8 @@ def main_page():
             return {"name": name, "type": "line", "smooth": True, "showSymbol": False, "data": [float(v) if pct else int(v) for v in vals], **extra}
 
         if chain:
-            series = [line(c["text"], term_mask(d0, "keywords", c["text"]).to_numpy()) for c in chain if c["op"] != "AND NOT"]
+            series = [line(term_label(c), term_mask(d0, "keywords", c["text"], c.get("cond", "contains")).to_numpy())
+                      for c in chain if c.get("cond", "contains") in ("contains", "equals", "begins", "ends")]
             m = chain_mask(d0, "keywords", chain)
             if len(chain) > 1 and m is not None:
                 series.append(line("Papers matching the whole chain", m, lineStyle={"width": 4, "type": "dashed"}))

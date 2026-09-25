@@ -16,7 +16,8 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
 - **Cross-check** the two sources paper by paper. Each paper is marked: both agree, they conflict (and on which field), or
   only one source has it.
 - **Papers tab:** search, sort, and filter by journal, years, paper type and source agreement. Text filters (title,
-  authors, keywords, abstract) take an **AND / OR / AND NOT chain of any length**, editable in a pop-up list.
+  authors, keywords, abstract) take **any number of conditions** - Contains, Does not contain, Equals, Does not equal, Begins with,
+  Ends with, Blank, Not blank - joined by AND / OR and edited in a pop-up list.
 - **Explore tab:** a keyword "slot machine" for finding ideas. Lock a keyword, shuffle to get 10 keywords from papers that
   also have it, lock another, and so on. Charts show the locked keywords over time and the most common other keywords.
   **Export the papers left after all filters to Excel** (same workbook layout as the full export, plus a Filters sheet) **or PDF.**
