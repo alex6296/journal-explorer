@@ -25,15 +25,16 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   Summary sheet with keyword counts.
 - **Settings tab (optional):** paste your own [Elsevier/Scopus API key](https://dev.elsevier.com/apikey/manage), with a short
   built-in video on where to get one, to also cross-check every paper against Scopus and pull in its citation count.
-  Pasting a key **tests it automatically** (no button to remember) - once it passes, a pop-up offers to re-download
-  your journals with Scopus included right away, and the header's **Update data** button relabels itself
-  "Update data (with Scopus)". A bad or gated key can't be turned on - it would otherwise just mark every paper
+  Pasting a key **tests it automatically** (no button to remember) - a verified key IS the switch: it goes straight
+  into re-downloading your journals with Scopus included, no extra click, and the button relabels itself "Update
+  data (with Scopus)" from then on. A bad or gated key can't turn it on - it would otherwise just mark every paper
   "not in Scopus". Pulls use Scopus Search's documented `start`/`count` paging (capped at 5,000 results per journal -
   that's the API's own limit, not this app's), paced to Elsevier's own guidance of about one request per second, and
-  stop themselves well before your weekly quota would run out. A key only returns full results from your
-  institution's network or its VPN; the app explains this in a pop-up if a request comes back gated. **Elsevier's
-  terms make data pulled with your key personal to you** - don't hand the `data` folder or an export with Scopus
-  columns filled in to anyone else.
+  stop themselves well before your weekly quota would run out; a network hiccup on any source gets a couple of
+  automatic retries before giving up. A key only returns full results from your institution's network or its VPN;
+  the app explains this in a pop-up if a request comes back gated. The whole Scopus path is logged to the console
+  (timestamped, key masked) if you want to see what it's doing. **Elsevier's terms make data pulled with your key
+  personal to you** - don't hand the `data` folder or an export with Scopus columns filled in to anyone else.
 
 ## Run it
 
