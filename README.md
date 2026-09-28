@@ -23,6 +23,13 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   **Export the papers left after all filters to Excel** (same workbook layout as the full export, plus a Filters sheet) **or PDF.**
 - **Export to Excel** (header button = everything you downloaded) in the layout of a Web of Science export: one sheet per journal with the same column tags, and a
   Summary sheet with keyword counts.
+- **Settings tab (optional):** paste your own [Elsevier/Scopus API key](https://dev.elsevier.com/apikey/manage) to also cross-check
+  every paper against Scopus and pull in its citation count. Requests are paced to Elsevier's own guidance (about
+  one per second) and the pull stops itself well before your weekly quota would run out. The key must pass a
+  **Test key** check before the cross-check can be turned on - a bad or gated key would otherwise just mark every
+  paper "not in Scopus". A key only returns full results from your institution's network or its VPN; the app
+  explains this in a pop-up if a request comes back gated. **Elsevier's terms make data pulled with your key
+  personal to you** - don't hand the `data` folder or an export with Scopus columns filled in to anyone else.
 
 ## Run it
 

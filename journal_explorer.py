@@ -63,7 +63,7 @@ WOS_COLUMNS = ("PT AU BA BE GP AF BF CA TI SO SE BS LA DT CT CY CL SP HO DE ID A
                "WC SC GA UT PM OA HC HP DA").split()
 # Columns we add on the right (not in WoS): journal, our type guess, the OpenAlex-vs-Crossref cross-check
 # (Sources / Check / Conflicts), Crossref's own citation count, and the OpenAlex id.
-EXTRA_COLUMNS = ["Journal", "Type", "Sources", "Check", "Conflicts", "CitedCrossref", "OpenAlexID"]
+EXTRA_COLUMNS = ["Journal", "Type", "Sources", "Check", "Conflicts", "CitedCrossref", "OpenAlexID", "CitedScopus", "ScopusCheck"]
 
 # Document types shown as filter chips. Everything else is grouped under "Other".
 DOC_TYPES = ["Article", "Review", "Book Review", "Editorial Material", "Letter", "Correction", "Front/Back Matter", "Other"]
@@ -114,7 +114,9 @@ VOCAB: frozenset = frozenset()
 
 def load_all() -> pd.DataFrame:
     """Stack every downloaded journal into one table (empty table if nothing downloaded yet)."""
-    frames = [pd.read_pickle(pkl(j)) for j in CONFIG["journals"] if pkl(j).exists()]
+    # reindex each frame: a .pkl saved by an older version of this app can be missing columns a newer version added
+    # (e.g. the Scopus columns) - fill those in as empty rather than crashing, so old downloaded data keeps working.
+    frames = [pd.read_pickle(pkl(j)).reindex(columns=WOS_COLUMNS + EXTRA_COLUMNS) for j in CONFIG["journals"] if pkl(j).exists()]
     if not frames:
         return pd.DataFrame(columns=WOS_COLUMNS + EXTRA_COLUMNS)
     df = pd.concat(frames, ignore_index=True)
@@ -226,6 +228,141 @@ def crossref_records(j: dict, progress) -> dict[str, dict]:
         progress(j["abbr"], "cr", len(out), msg["total-results"])
 
 
+# ----------------------------------------------------------------------------------------------
+# 3b. ELSEVIER / SCOPUS (optional - only runs if the user pastes a key into Settings)
+# ----------------------------------------------------------------------------------------------
+# Elsevier's own guidance is "1 call per second rather than 100 calls in parallel in 1 second" even though the
+# key's hard ceiling is higher (9/sec for Scopus Search). We stay at the pace they ask for, not the ceiling.
+ELS_PACE_SECONDS = 1.0
+ELS_QUOTA_FLOOR = 25          # stop early once this many search requests are left, so a big journal never empties the key
+
+
+class ElsevierGatedError(Exception):
+    """The key is not recognized as belonging to a subscribing institution from this network."""
+
+
+class ElsevierQuotaError(Exception):
+    """The key's weekly search quota is used up (or nearly so)."""
+
+    def __init__(self, reset_at: str):
+        self.reset_at = reset_at
+        super().__init__(f"quota exhausted, resets {reset_at}")
+
+
+def elsevier_rows(j: dict, progress) -> dict[str, dict]:
+    """Every paper of one journal from the Scopus Search API, keyed by lower-case DOI. Cursor pagination (not
+    offset) so journals over 5,000 results still work. One request at a time, paced to Elsevier's own guidance,
+    and we stop well before the weekly quota would actually run out."""
+    key = (CONFIG.get("elsevier_key") or "").strip()
+    if not key:
+        return {}
+    headers = {"X-ELS-APIKey": key, "Accept": "application/json"}
+    out: dict[str, dict] = {}
+    cursor, total, last_call = "*", None, 0.0
+    while True:
+        wait = ELS_PACE_SECONDS - (time.time() - last_call)
+        if wait > 0:
+            time.sleep(wait)                                      # pace to ~1 request/second, as Elsevier asks
+        last_call = time.time()
+        try:
+            r = requests.get("https://api.elsevier.com/content/search/scopus", headers=headers, timeout=30,
+                              params={"query": f"ISSN({j['issn']})", "count": 100, "cursor": cursor, "view": "STANDARD"})
+        except requests.exceptions.RequestException as e:
+            raise ElsevierGatedError(f"could not reach Elsevier ({e})") from e
+        if r.status_code == 429 or r.headers.get("X-ELS-Status") == "QUOTA_EXCEEDED":
+            reset = r.headers.get("X-RateLimit-Reset")
+            reset_at = datetime.fromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M") if reset else "next week"
+            raise ElsevierQuotaError(reset_at)
+        if r.status_code in (401, 403):
+            raise ElsevierGatedError(f"HTTP {r.status_code} - the key was rejected")
+        r.raise_for_status()
+        remaining = r.headers.get("X-RateLimit-Remaining")
+        msg = r.json().get("search-results", {})
+        if total is None:
+            total = int(msg.get("opensearch:totalResults", 0))
+            if total > 0 and not msg.get("entry"):                 # Elsevier says papers exist but sends none back:
+                raise ElsevierGatedError("Scopus reports results but returns none - this key is probably not "
+                                          "recognized as belonging to a subscribing institution from this network")
+        entries = msg.get("entry") or []
+        for e in entries:
+            doi = e.get("prism:doi")
+            if not doi:
+                continue
+            pages = (e.get("prism:pageRange") or "").split("-")
+            out[doi.lower()] = {
+                "TI": e.get("dc:title"), "PY": (e.get("prism:coverDate") or "")[:4] or None,
+                "VL": e.get("prism:volume"), "IS": e.get("prism:issueIdentifier"),
+                "BP": pages[0] or None, "n_auth": None,             # standard view has no full author count
+                "TC": int(e["citedby-count"]) if e.get("citedby-count") not in (None, "") else None,
+                "eid": e.get("eid")}
+        progress(j["abbr"], "sc", len(out), total or len(out))
+        nxt = ((msg.get("cursor") or {}).get("@next"))
+        if not entries or not nxt or nxt == cursor or len(out) >= total:
+            return out
+        cursor = nxt
+        if remaining is not None and int(remaining) <= ELS_QUOTA_FLOOR:
+            return out                                              # stop with what we have rather than risk a 429
+
+
+def test_elsevier_key(key: str) -> str:
+    """One lightweight request, used by the Settings 'Test key' button. Returns a short, human result string, or
+    raises ElsevierGatedError / ElsevierQuotaError, which the caller turns into the explanatory pop-up."""
+    small_journal = min(CONFIG["journals"], key=lambda j: j.get("works_count") or 1e9) if CONFIG["journals"] else \
+        {"issn": "2333-2050", "name": "Strategy Science"}
+    r = requests.get("https://api.elsevier.com/content/search/scopus", timeout=20,
+                      headers={"X-ELS-APIKey": key.strip(), "Accept": "application/json"},
+                      params={"query": f"ISSN({small_journal['issn']})", "count": 1})
+    if r.status_code == 429 or r.headers.get("X-ELS-Status") == "QUOTA_EXCEEDED":
+        reset = r.headers.get("X-RateLimit-Reset")
+        raise ElsevierQuotaError(datetime.fromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M") if reset else "next week")
+    if r.status_code in (401, 403):
+        raise ElsevierGatedError(f"HTTP {r.status_code} - the key was rejected")
+    r.raise_for_status()
+    total = int(r.json().get("search-results", {}).get("opensearch:totalResults", 0))
+    if total > 0 and not r.json().get("search-results", {}).get("entry"):
+        raise ElsevierGatedError("Scopus reports results but returns none - this key is probably not recognized as "
+                                  "belonging to a subscribing institution from this network")
+    remaining = r.headers.get("X-RateLimit-Remaining", "?")
+    return f"Key works. Scopus lists {total:,} papers for {small_journal['name']} ({remaining} search requests left this week)."
+
+
+def scopus_check(row: dict, s: dict) -> tuple[str | None, str | None]:
+    """Compare one paper's OpenAlex/Crossref-merged fields against its Scopus record. Same idea as `compare()` for
+    OpenAlex vs Crossref, kept separate because it runs on a finished row, not while one is being built."""
+    diffs, compared = [], 0
+    pairs = [("year", row.get("PY"), s.get("PY"), lambda a, b: abs(int(a) - int(b)) <= 1),
+             ("volume", row.get("VL"), s.get("VL"), None), ("issue", row.get("IS"), s.get("IS"), None),
+             ("first page", row.get("BP"), s.get("BP"), None),
+             ("title", row.get("TI"), s.get("TI"), lambda a, b: norm(a) in norm(b) or norm(b) in norm(a))]
+    for field, a, b, same in pairs:
+        if a in (None, "", 0) or b in (None, "", 0):
+            continue
+        compared += 1
+        if not (same(a, b) if same else str(a) == str(b)):
+            diffs.append(field)
+    if diffs:
+        return "\u26a0\ufe0f Differs from Scopus: " + ", ".join(diffs), ""
+    if compared:
+        return "\u2705 Also matches Scopus", ""
+    return "\u25fb In Scopus, nothing to compare", ""
+
+
+def apply_scopus(df: pd.DataFrame, scopus: dict[str, dict]) -> None:
+    """Add the Scopus columns to an already-merged OpenAlex+Crossref table, in place."""
+    if not scopus:
+        df["CitedScopus"], df["ScopusCheck"] = None, ""
+        return
+    cited, check = [], []
+    for _, row in df.iterrows():
+        s = scopus.get((row["DI"] or "").lower())
+        if s is None:
+            cited.append(None); check.append("\u25fb Not in Scopus")
+        else:
+            c, _ = scopus_check(row, s)
+            cited.append(s.get("TC")); check.append(c)
+    df["CitedScopus"], df["ScopusCheck"] = cited, check
+
+
 def norm(text) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
@@ -293,13 +430,23 @@ def merge(oa_rows: list[dict], cr: dict[str, dict], j: dict) -> pd.DataFrame:
 
 
 def refresh_journal(j: dict, progress) -> None:
-    """Download one journal from both sources AT THE SAME TIME (two threads) and save the merged table.
-    Always a full re-pull: it takes minutes, and it keeps citation counts fresh."""
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    """Download one journal from OpenAlex + Crossref AT THE SAME TIME (always), and from Scopus too if a key is
+    set in Settings (its own thread, paced separately). A Scopus problem never breaks the real download - it is
+    caught here and left for the UI to explain (STATE["elsevier_notice"])."""
+    use_scopus = bool((CONFIG.get("elsevier_key") or "").strip()) and CONFIG.get("elsevier_enabled") and CONFIG.get("elsevier_verified")
+    with ThreadPoolExecutor(max_workers=3) as pool:
         openalex = pool.submit(openalex_rows, j, progress)
         crossref = pool.submit(crossref_records, j, progress)
+        scopus_future = pool.submit(elsevier_rows, j, progress) if use_scopus else None
         oa_rows, cr = openalex.result(), crossref.result()
+        scopus = {}
+        if scopus_future is not None:
+            try:
+                scopus = scopus_future.result()
+            except (ElsevierGatedError, ElsevierQuotaError) as e:
+                STATE["elsevier_notice"] = e
     df = merge(oa_rows, cr, j)
+    apply_scopus(df, scopus)
     df.to_pickle(pkl(j))
     CONFIG["last_fetch"][j["abbr"]] = date.today().isoformat()
     save_config(CONFIG)
@@ -391,7 +538,7 @@ def export_excel(selection: pd.DataFrame | None = None) -> Path:
             for j in CONFIG["journals"]:
                 if not pkl(j).exists():
                     continue
-                raw = pd.read_pickle(pkl(j))[WOS_COLUMNS + EXTRA_COLUMNS]
+                raw = pd.read_pickle(pkl(j)).reindex(columns=WOS_COLUMNS + EXTRA_COLUMNS)  # old .pkl may lack newer columns
                 if keep is not None:                                     # only the selected papers
                     raw = raw[raw["OpenAlexID"].fillna(raw["DI"]).isin(keep)]
                     if raw.empty:
@@ -406,6 +553,10 @@ def export_excel(selection: pd.DataFrame | None = None) -> Path:
                 cc = df.columns.get_loc("Check")                         # colour the cross-check: green / amber / grey
                 for r, v in enumerate(df["Check"].fillna(""), start=1):
                     ws.write_string(r, cc, v, fills.get(v[:1], fills["other"]))
+                if df["ScopusCheck"].fillna("").ne("").any():             # only if Scopus data is actually present
+                    sc = df.columns.get_loc("ScopusCheck")
+                    for r, v in enumerate(df["ScopusCheck"].fillna(""), start=1):
+                        ws.write_string(r, sc, v, fills.get(v[:1], fills["other"]))
                 data.append((j, sh, df))
 
             # ---- Summary: keyword hits per journal in Title / Abstract / Keywords (live formulas + cached values) ----
@@ -711,8 +862,10 @@ def progress(abbr: str, source: str, done: int, total: int) -> None:
 
 def download_all(journals: list[dict]) -> None:
     """Runs in a background thread so the page stays responsive."""
-    STATE.update(busy=True, error="", started=time.time(),
-                 jobs={j["abbr"]: {"name": j["name"], "oa": [0, 0], "cr": [0, 0], "state": "waiting"} for j in journals})
+    use_scopus = bool((CONFIG.get("elsevier_key") or "").strip()) and CONFIG.get("elsevier_enabled") and CONFIG.get("elsevier_verified")
+    STATE.update(busy=True, error="", started=time.time(), elsevier_notice=None,
+                 jobs={j["abbr"]: {"name": j["name"], "oa": [0, 0], "cr": [0, 0], "state": "waiting",
+                                    **({"sc": [0, 0]} if use_scopus else {})} for j in journals})
     try:
         for j in journals:
             STATE["jobs"][j["abbr"]]["state"] = "downloading"
@@ -739,6 +892,26 @@ def main_page():
     modal_host = ui.element("div")
 
     # =============================== small helpers ===============================
+    def test_elsevier_key_wrapper(k: str) -> str:
+        return test_elsevier_key(k)
+
+    def show_elsevier_notice(err: Exception):
+        gated = isinstance(err, ElsevierGatedError)
+        with ui.dialog() as dlg, ui.card().classes("w-[600px] max-w-full gap-2"):
+            ui.label("Scopus didn't respond as expected" if gated else "Scopus quota used up for this week").classes("text-h6")
+            if gated:
+                ui.markdown("Elsevier only sends full Scopus results to requests from a network it recognizes as "
+                            "belonging to a subscribing institution. **This almost always means:**\n\n"
+                            "- try your **school or work network** directly (not a home connection), or\n"
+                            "- turn on your institution's **VPN**, then press **Update data** again\n\n"
+                            "If that still doesn't work, double-check the key under **Journals -> Settings**.")
+            else:
+                ui.markdown(f"Your Elsevier key's weekly search quota is used up. It resets around **{err.reset_at}**. "
+                           "OpenAlex and Crossref downloaded normally - only the Scopus cross-check was skipped.")
+            ui.label(f"Technical detail: {err}").classes("text-caption text-grey-7")
+            ui.button("OK", on_click=dlg.close).props("color=primary")
+        dlg.open()
+
     def show_about():
         with ui.dialog() as dlg, ui.card().classes("w-[800px] max-w-full"):
             ui.markdown(DISCLAIMER).classes("max-h-[70vh] overflow-auto")
@@ -778,7 +951,7 @@ def main_page():
     with ui.dialog().props("persistent maximized") as dl_dialog:
         with ui.card().classes("w-full h-full items-center justify-center gap-6").style("background:#f4f6f8"):
             ui.label("Downloading your journals").classes("text-h3 text-primary")
-            ui.label("OpenAlex (the papers) and Crossref (the reference lists) are downloaded at the same time. "
+            overlay_note = ui.label("OpenAlex (the papers) and Crossref (the reference lists) are downloaded at the same time. "
                      "Keep this window open - it closes by itself when done.").classes("text-subtitle1 text-grey-8")
             overall_bar = ui.linear_progress(value=0, show_value=False, size="30px").classes("w-3/4").props("rounded instant-feedback")
             overall_lbl = ui.label().classes("text-h5")
@@ -793,7 +966,10 @@ def main_page():
                                 ui.label(job["name"]).classes("text-subtitle1 text-bold")
                                 ui.space()
                                 ui.label({"waiting": "waiting", "downloading": "downloading", "done": "done ✓"}[job["state"]]).classes("text-caption")
-                            for key, label in (("oa", "OpenAlex - papers"), ("cr", "Crossref - references")):
+                            steps = [("oa", "OpenAlex - papers"), ("cr", "Crossref - references")]
+                            if "sc" in job:
+                                steps.append(("sc", "Scopus - cross-check"))
+                            for key, label in steps:
                                 done, total = job[key]
                                 with ui.row().classes("items-center w-full no-wrap"):
                                     ui.label(label).classes("w-48 text-caption")
@@ -804,8 +980,10 @@ def main_page():
     def tick():                                                   # twice a second while a download runs
         if not STATE["busy"]:
             return
-        fr = [((j["oa"][0] / j["oa"][1] if j["oa"][1] else 0) + (j["cr"][0] / j["cr"][1] if j["cr"][1] else 0)) / 2
-              for j in STATE["jobs"].values()]
+        def frac(job):
+            vals = [job[k][0] / job[k][1] for k in ("oa", "cr") + (("sc",) if "sc" in job else ()) if job[k][1]]
+            return sum(vals) / len(vals) if vals else 0
+        fr = [frac(j) for j in STATE["jobs"].values()]
         pct = sum(fr) / max(len(fr), 1)
         overall_bar.value = pct
         overall_lbl.text = f"{pct * 100:.0f}%"
@@ -824,6 +1002,8 @@ def main_page():
             ui.notify(f"Download problem: {STATE['error']}", type="negative", multi_line=True, close_button=True, timeout=0)
         else:
             ui.notify("Download finished", type="positive")
+        if STATE.get("elsevier_notice"):
+            show_elsevier_notice(STATE["elsevier_notice"])
         reload_data()
 
     async def do_pdf():
@@ -1026,7 +1206,9 @@ def main_page():
         ui.label(f"{len(d):,} papers").classes("text-subtitle2")
         cols = [("Journal", 90), ("PY", 80), ("TI", 520), ("AU", 240), ("Type", 130), ("Check", 210), ("TC", 90), ("CitedCrossref", 110), ("DE", 300), ("DI", 180)]
         names = {"PY": "Year", "TI": "Title", "AU": "Authors", "TC": "Cited (OpenAlex)", "CitedCrossref": "Cited (Crossref)",
-                 "DE": "Keywords", "DI": "DOI", "Check": "Sources agree?"}
+                 "DE": "Keywords", "DI": "DOI", "Check": "Sources agree?", "CitedScopus": "Cited (Scopus)", "ScopusCheck": "Scopus check"}
+        if d["ScopusCheck"].fillna("").ne("").any():                     # only shown once you have used a Scopus key
+            cols += [("CitedScopus", 110), ("ScopusCheck", 200)]
         grid = ui.aggrid({
             "columnDefs": [{"field": c, "headerName": names.get(c, c), "minWidth": w, "flex": w} for c, w in cols],
             "rowData": d[[c for c, _ in cols] + ["AB", "CR", "AF", "Conflicts"]].head(50000).where(d.notna(), None).to_dict("records"),
@@ -1220,7 +1402,8 @@ def main_page():
     with ui.tabs().classes("w-full") as tabs:
         ui.tab("Papers", icon="table_rows")
         ui.tab("Explore", icon="casino")
-        ui.tab("Journals", icon="settings")
+        ui.tab("Journals", icon="library_books")
+        ui.tab("Settings", icon="settings")
 
     with ui.tab_panels(tabs, value="Papers", on_change=on_tab).classes("w-full").style("background: transparent"):
         with ui.tab_panel("Papers"):
@@ -1238,6 +1421,71 @@ def main_page():
                           on_change=lambda e: (EX.update(kw_mode=e.value), charts.refresh()))
             charts()
             plist()
+
+        with ui.tab_panel("Settings"):
+            ui.label("Elsevier / Scopus (optional)").classes("text-h6")
+            ui.markdown("Cross-checks each paper against **Scopus** as well as OpenAlex and Crossref, and adds Scopus's "
+                        "own citation count. Left blank, nothing changes: the app works exactly as before.").classes("text-body2")
+            with ui.row().classes("items-center gap-1"):
+                ui.label("Get a free key at")
+                ui.link("dev.elsevier.com/apikey/manage", "https://dev.elsevier.com/apikey/manage", new_tab=True)
+            ui.label("It only returns full results from your institution's network (or its VPN), even once the key "
+                    "itself is valid - that's Elsevier's own gating, not a bug here.").classes("text-caption text-grey-7")
+            key_input = ui.input("Elsevier API key", value=CONFIG.get("elsevier_key", ""), password=True,
+                                 password_toggle_button=True).props("outlined dense clearable").classes("w-96")
+
+            def unverify(*_):                                     # any edit to the key invalidates the last test
+                if CONFIG.get("elsevier_verified"):
+                    CONFIG["elsevier_verified"] = False
+                    CONFIG["elsevier_enabled"] = False
+                    enable_box.value = False
+                    enable_box.enabled = False
+                    save_config(CONFIG)
+            key_input.on("input", unverify)
+
+            def save_key():
+                CONFIG["elsevier_key"] = key_input.value or ""
+                save_config(CONFIG)
+                if not CONFIG["elsevier_key"]:
+                    CONFIG.update(elsevier_enabled=False, elsevier_verified=False)
+                    enable_box.value, enable_box.enabled = False, False
+                    save_config(CONFIG)
+            key_input.on("blur", save_key)
+
+            def toggle_enabled(e):
+                CONFIG["elsevier_enabled"] = e.value
+                save_config(CONFIG)
+            # Locked until a key has been TESTED successfully - a wrong or gated key would otherwise silently mark
+            # every single paper "Not in Scopus" for the whole download, which is worse than not trying at all.
+            enable_box = ui.checkbox("Also cross-check against Scopus on the next 'Update data'",
+                                     value=CONFIG.get("elsevier_enabled", False), on_change=toggle_enabled)
+            enable_box.enabled = bool(CONFIG.get("elsevier_verified"))
+            lock_note = ui.label("" if enable_box.enabled else "Test the key successfully first - see below.").classes("text-caption text-warning")
+            test_result = ui.label().classes("text-caption")
+
+            async def test_key():
+                if not key_input.value:
+                    ui.notify("Enter a key first.", type="warning")
+                    return
+                save_key()
+                test_result.text = "Testing..."
+                try:
+                    msg = await run.io_bound(test_elsevier_key_wrapper, key_input.value)
+                    test_result.text = msg
+                    CONFIG["elsevier_verified"], CONFIG["elsevier_enabled"] = True, True   # verified -> switch it on
+                    save_config(CONFIG)
+                    enable_box.enabled, enable_box.value, lock_note.text = True, True, ""
+                except (ElsevierGatedError, ElsevierQuotaError) as e:
+                    test_result.text = ""
+                    show_elsevier_notice(e)
+                except Exception as e:
+                    test_result.text = f"Could not reach Elsevier: {e}"
+            ui.button("Test key", icon="wifi_tethering", on_click=test_key).props("outline no-caps color=primary")
+            ui.separator()
+            ui.markdown("**Elsevier's terms:** a Scopus corpus pulled with your key is *personal to you* and "
+                        "should not be handed to other people - that includes this app's `data` folder and any "
+                        "Excel/PDF export once Scopus columns are filled in. Sharing the app itself, and its "
+                        "OpenAlex + Crossref data, is unaffected - that data is open.").classes("text-caption text-grey-7")
 
         with ui.tab_panel("Journals"):
             ui.label("Tracked journals").classes("text-h6")
