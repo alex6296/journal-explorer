@@ -29,12 +29,17 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   into re-downloading your journals with Scopus included, no extra click, and the button relabels itself "Update
   data (with Scopus)" from then on. A bad or gated key can't turn it on - it would otherwise just mark every paper
   "not in Scopus". Pulls use Scopus Search's documented `start`/`count` paging (capped at 5,000 results per journal -
-  that's the API's own limit, not this app's), paced to Elsevier's own guidance of about one request per second, and
-  stop themselves well before your weekly quota would run out; a network hiccup on any source gets a couple of
-  automatic retries before giving up. A key only returns full results from your institution's network or its VPN;
-  the app explains this in a pop-up if a request comes back gated. The whole Scopus path is logged to the console
-  (timestamped, key masked) if you want to see what it's doing. **Elsevier's terms make data pulled with your key
-  personal to you** - don't hand the `data` folder or an export with Scopus columns filled in to anyone else.
+  that's the API's own limit, not this app's, and pages default to `count=25` since that's what Elsevier's own
+  client libraries confirm a non-subscriber key is capped at), paced to Elsevier's own guidance of about one
+  request per second, and stop themselves well before your weekly quota would run out; a network hiccup on any
+  source gets a couple of automatic retries before giving up, and a real problem Elsevier's server reports (a
+  400/401/403/429/500/...) never breaks the OpenAlex/Crossref part of the download - just the Scopus columns for
+  that journal. A key only returns full results from your institution's network or its VPN; if your institution
+  issued an **institution token** as well (Elsevier's own documented way around exactly that), there's a second
+  field in Settings for it. The app explains gating in a pop-up if a request comes back blocked either way. The
+  whole Scopus path is logged to the console (timestamped, key masked) if you want to see what it's doing.
+  **Elsevier's terms make data pulled with your key personal to you** - don't hand the `data` folder or an export
+  with Scopus columns filled in to anyone else.
 
 ## Run it
 

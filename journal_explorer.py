@@ -263,6 +263,29 @@ class ElsevierQuotaError(Exception):
 ELS_START_CAP = 5000           # Scopus Search's documented offset ("start") pagination stops here; see the note below
 
 
+def elsevier_headers(req_id: str) -> dict:
+    """Every documented header this app sends to Elsevier. X-ELS-Insttoken is the REAL fix for the "gated" problem
+    when one exists: it's Elsevier's own mechanism for an institution to grant remote access without a VPN (the
+    WADL spec calls it out as an override for the API key alone). X-ELS-ReqId is a client-chosen id Elsevier's
+    support can use to trace one specific request if it's ever needed."""
+    h = {"X-ELS-APIKey": (CONFIG.get("elsevier_key") or "").strip(), "Accept": "application/json", "X-ELS-ReqId": req_id}
+    token = (CONFIG.get("elsevier_insttoken") or "").strip()
+    if token:
+        h["X-ELS-Insttoken"] = token
+    return h
+
+
+def elsevier_raise_for_status(r, where: str):
+    """Turn ANY non-200 response into one of our two typed errors - never requests' own generic HTTPError - so
+    refresh_journal's Scopus-specific except clause always catches it and a Scopus problem can never abort the
+    whole download. Covers every status the WADL doc lists (400/401/403/405/406/429/500), not just the ones we
+    have specific handling for above."""
+    if r.status_code == 200:
+        return
+    log.warning("scopus: %s - HTTP %s: %s", where, r.status_code, r.text[:200])
+    raise ElsevierGatedError(f"HTTP {r.status_code} from Scopus at {where} (response: {r.text[:200]})")
+
+
 def elsevier_rows(j: dict, progress) -> dict[str, dict]:
     """Every paper of one journal from the Scopus Search API, keyed by lower-case DOI. Uses `start`/`count` offset
     paging - the one pagination method the official WADL spec actually documents. (An earlier version used the
@@ -274,7 +297,8 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
     key = (CONFIG.get("elsevier_key") or "").strip()
     if not key:
         return {}
-    headers = {"X-ELS-APIKey": key, "Accept": "application/json"}
+    req_id = f"journal-explorer-{j['abbr']}-{uuid.uuid4().hex[:8]}"
+    headers = elsevier_headers(req_id)
     out: dict[str, dict] = {}
     start, total, last_call = 0, None, 0.0
     # Elsevier's docs don't spell this out on the WADL page, but their own client libraries confirm it: the STANDARD
@@ -282,7 +306,7 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
     # COMPLETE view can ask for up to 200 at once. Starting at 25 avoids a wasted, failed first request for almost
     # everyone; the code below still adapts if some other tier turns out to allow even less.
     count = 25
-    log.info("scopus: %s (ISSN %s) - starting pull", j["name"], j["issn"])  # tier doesn't allow pages this big
+    log.info("scopus: %s (ISSN %s) - starting pull (req id %s)", j["name"], j["issn"], req_id)
     t0 = time.time()
     while True:
         wait = ELS_PACE_SECONDS - (time.time() - last_call)
@@ -311,10 +335,7 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
                 count = max(1, count // 2)
                 log.warning("scopus: %s - page size not allowed for this key's service level, dropping to %s and retrying", j["abbr"], count)
                 continue
-            log.warning("scopus: %s - HTTP 400 at start=%s: %s", j["abbr"], start, r.text[:200])
-            raise ElsevierGatedError(f"HTTP 400 from Scopus - the query it received: ISSN({j['issn']}) "
-                                      f"(response: {r.text[:200]})")
-        r.raise_for_status()
+        elsevier_raise_for_status(r, f"{j['abbr']} start={start}")  # any other non-200 (400/405/406/500/...)
         remaining = r.headers.get("X-RateLimit-Remaining")
         msg = r.json().get("search-results", {})
         if total is None:
@@ -335,7 +356,7 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
                 "VL": e.get("prism:volume"), "IS": e.get("prism:issueIdentifier"),
                 "BP": pages[0] or None, "n_auth": None,             # standard view has no full author count
                 "TC": int(e["citedby-count"]) if e.get("citedby-count") not in (None, "") else None,
-                "eid": e.get("eid")}
+                "eid": e.get("eid"), "creator": e.get("dc:creator")}   # first/primary author (real STANDARD-view field)
         progress(j["abbr"], "sc", len(out), min(total, ELS_START_CAP) or len(out))
         log.info("scopus: %s - page at start=%s, %s entries (%s/%s so far)", j["abbr"], start, len(entries), f"{len(out):,}", f"{total:,}")
         start += len(entries)
@@ -358,9 +379,11 @@ def test_elsevier_key(key: str) -> str:
     carry a `works_count` to compare, which used to make this silently query SMJ (4,500+ results) instead. Returns a
     short, human result string, or raises ElsevierGatedError / ElsevierQuotaError for the caller's pop-up."""
     test_journal = {"issn": "2333-2050", "name": "Strategy Science"}
-    log.info("scopus: testing key (masked: %s...%s)", key[:4], key[-2:] if len(key) > 6 else "")
-    r = requests.get("https://api.elsevier.com/content/search/scopus", timeout=20,
-                      headers={"X-ELS-APIKey": key.strip(), "Accept": "application/json"},
+    req_id = f"journal-explorer-test-{uuid.uuid4().hex[:8]}"
+    headers = elsevier_headers(req_id)
+    headers["X-ELS-APIKey"] = key.strip()  # the key just typed, which may not be saved to CONFIG yet
+    log.info("scopus: testing key (masked: %s...%s, req id %s)", key[:4], key[-2:] if len(key) > 6 else "", req_id)
+    r = requests.get("https://api.elsevier.com/content/search/scopus", timeout=20, headers=headers,
                       params={"query": f"ISSN({test_journal['issn']})", "count": 1})
     log.info("scopus: test response HTTP %s, remaining=%s", r.status_code, r.headers.get("X-RateLimit-Remaining", "?"))
     if r.status_code == 429 or r.headers.get("X-ELS-Status") == "QUOTA_EXCEEDED":
@@ -368,7 +391,7 @@ def test_elsevier_key(key: str) -> str:
         raise ElsevierQuotaError(datetime.fromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M") if reset else "next week")
     if r.status_code in (401, 403):
         raise ElsevierGatedError(f"HTTP {r.status_code} - the key was rejected")
-    r.raise_for_status()
+    elsevier_raise_for_status(r, "key test")           # any other non-200 (405/406/500/...) - never a raw HTTPError
     total = int(r.json().get("search-results", {}).get("opensearch:totalResults", 0))
     if total > 0 and not r.json().get("search-results", {}).get("entry"):
         log.warning("scopus: test - %s papers reported but zero entries returned (looks gated)", total)
@@ -405,15 +428,20 @@ def apply_scopus(df: pd.DataFrame, scopus: dict[str, dict]) -> None:
     if not scopus:
         df["CitedScopus"], df["ScopusCheck"] = None, ""
         return
-    cited, check = [], []
-    for _, row in df.iterrows():
+    cited, check, filled_author = [], [], 0
+    for i, row in df.iterrows():
         s = scopus.get((row["DI"] or "").lower())
         if s is None:
             cited.append(None); check.append("\u25fb Not in Scopus")
         else:
             c, _ = scopus_check(row, s)
             cited.append(s.get("TC")); check.append(c)
+            if not (row.get("AU") or "").strip() and s.get("creator"):  # OpenAlex/Crossref had no author at all -
+                df.at[i, "AU"] = df.at[i, "AF"] = s["creator"]           # Scopus's first-author field fills the gap
+                filled_author += 1
     df["CitedScopus"], df["ScopusCheck"] = cited, check
+    if filled_author:
+        log.info("scopus: filled in a missing author name from Scopus for %s paper(s)", filled_author)
 
 
 def norm(text) -> str:
@@ -995,8 +1023,14 @@ def main_page():
             with ui.row():
                 ui.button("I understand", on_click=dlg.close)
                 if DF.empty:                                      # first run: offer the download straight away
+                    async def start_now():
+                        # NOT `lambda: (dlg.close(), run_download(...))` - a tuple isn't awaitable, so NiceGUI never
+                        # schedules the coroutine inside it and the download silently never starts. Found while
+                        # auditing every async handler in the app for the same mistake (see on_insttoken_change).
+                        dlg.close()
+                        await run_download(list(CONFIG["journals"]))
                     ui.button("I understand - download the journals now", icon="cloud_download",
-                              on_click=lambda: (dlg.close(), run_download(list(CONFIG["journals"])))).props("color=primary")
+                              on_click=start_now).props("color=primary")
         dlg.open()
 
     def refresh_views():
@@ -1518,6 +1552,17 @@ def main_page():
             # switching networks.
             key_input = ui.input("Elsevier API key", value=CONFIG.get("elsevier_key", ""), password=True,
                                  password_toggle_button=True).props("outlined dense clearable debounce=900").classes("w-96")
+            ui.label("Institution token (only if your institution issued you one)").classes("text-caption text-grey-7 q-mt-sm")
+            insttoken_input = ui.input(value=CONFIG.get("elsevier_insttoken", ""), password=True,
+                                       password_toggle_button=True).props("outlined dense clearable debounce=900").classes("w-96")
+
+            async def on_insttoken_change(e):
+                # NOTE: must be a real async function, not `lambda e: (save(), test_key())` - a tuple isn't
+                # awaitable, so NiceGUI's "schedule it if the handler returns an awaitable" never fires on one.
+                CONFIG["elsevier_insttoken"] = (insttoken_input.value or "").strip()
+                save_config(CONFIG)
+                await test_key()
+            insttoken_input.on_value_change(on_insttoken_change)
             # No on/off checkbox: a verified key IS the switch. Clear the key (or a key that fails its test) turns
             # the cross-check back off; a key that passes turns it on and starts the download right away.
             test_result = ui.label("Type a key above - it is tested automatically." if not CONFIG.get("elsevier_verified")
