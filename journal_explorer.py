@@ -277,7 +277,12 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
     headers = {"X-ELS-APIKey": key, "Accept": "application/json"}
     out: dict[str, dict] = {}
     start, total, last_call = 0, None, 0.0
-    log.info("scopus: %s (ISSN %s) - starting pull", j["name"], j["issn"])
+    # Elsevier's docs don't spell this out on the WADL page, but their own client libraries confirm it: the STANDARD
+    # view (which is what a free, non-subscriber key gets) is capped at count=25; only a subscriber-tier key on the
+    # COMPLETE view can ask for up to 200 at once. Starting at 25 avoids a wasted, failed first request for almost
+    # everyone; the code below still adapts if some other tier turns out to allow even less.
+    count = 25
+    log.info("scopus: %s (ISSN %s) - starting pull", j["name"], j["issn"])  # tier doesn't allow pages this big
     t0 = time.time()
     while True:
         wait = ELS_PACE_SECONDS - (time.time() - last_call)
@@ -286,7 +291,7 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
         last_call = time.time()
         try:
             r = requests.get("https://api.elsevier.com/content/search/scopus", headers=headers, timeout=30,
-                              params={"query": f"ISSN({j['issn']})", "count": 100, "start": start, "view": "STANDARD"})
+                              params={"query": f"ISSN({j['issn']})", "count": count, "start": start, "view": "STANDARD"})
         except requests.exceptions.RequestException as e:
             log.warning("scopus: %s - network error at start=%s: %s", j["abbr"], start, e)
             raise ElsevierGatedError(f"could not reach Elsevier ({e})") from e
@@ -299,6 +304,13 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
             log.warning("scopus: %s - HTTP %s (key rejected)", j["abbr"], r.status_code)
             raise ElsevierGatedError(f"HTTP {r.status_code} - the key was rejected")
         if r.status_code == 400:
+            # 25 should work for every account tier (see the comment above), but on the off chance some tier is
+            # even more restricted, Elsevier says so in the body rather than a distinct status code - detected by
+            # the message, we just halve the page size and retry instead of treating it as a hard failure.
+            if count > 1 and "maximum number" in r.text.lower():
+                count = max(1, count // 2)
+                log.warning("scopus: %s - page size not allowed for this key's service level, dropping to %s and retrying", j["abbr"], count)
+                continue
             log.warning("scopus: %s - HTTP 400 at start=%s: %s", j["abbr"], start, r.text[:200])
             raise ElsevierGatedError(f"HTTP 400 from Scopus - the query it received: ISSN({j['issn']}) "
                                       f"(response: {r.text[:200]})")

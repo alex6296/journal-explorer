@@ -1,8 +1,12 @@
-nicegui
-pyalex
-pandas
-openpyxl
-requests
-pyinstaller
-xlsxwriter
-reportlab
+# Lower bounds only (not exact pins), set to versions known to have prebuilt wheels for Python 3.11 on Windows/Mac/Linux.
+# Without these, pip's resolver can backtrack into years-old releases (seen on GitHub Actions: an unpinned pandas
+# backtracked to 1.4.4, which has no prebuilt wheel here and fails to build from source against a current
+# setuptools). A floor avoids that without pinning exact versions that will eventually go stale.
+nicegui>=3.17
+pyalex>=0.18
+pandas>=2.2
+openpyxl>=3.1
+requests>=2.31
+pyinstaller>=6.10
+xlsxwriter>=3.2
+reportlab>=4.2
