@@ -23,7 +23,7 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   **Export the papers left after all filters to Excel** (same workbook layout as the full export, plus a Filters sheet) **or PDF.**
 - **Export to Excel** (header button = everything you downloaded) in the layout of a Web of Science export: one sheet per journal with the same column tags, and a
   Summary sheet with keyword counts.
-- **Settings tab (optional):** paste your own [Elsevier/Scopus API key](https://dev.elsevier.com/apikey/create), with a short
+- **Settings tab (optional):** paste your own [Elsevier/Scopus API key](https://dev.elsevier.com/apikey/manage), with a short
   built-in video on where to get one, to also cross-check every paper against Scopus and pull in its citation count.
   Pasting a key **tests it automatically** (no button to remember) - once it passes, a pop-up offers to re-download
   your journals with Scopus included right away, and the header's **Update data** button relabels itself
