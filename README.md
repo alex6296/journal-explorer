@@ -17,6 +17,9 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   only one source has it.
 - **Papers tab:** search, sort, and filter by journal, years, paper type, source agreement, and which source(s) a
   paper must have been found by (e.g. only papers that are in Scopus) - the same filter is on the Explore tab too.
+  "Sources agree?" is honest about how many sources are actually in play: with Scopus off it's the original
+  OpenAlex/Crossref comparison, and once Scopus is on it folds all three in ("OpenAlex & Crossref agree", not a
+  fixed "both"). All your filters, conditions and journal selection are remembered between restarts.
   Text filters (title,
   authors, keywords, abstract) take **any number of conditions** - Contains, Does not contain, Equals, Does not equal, Begins with,
   Ends with, Blank, Not blank - joined by AND / OR and edited in a pop-up list.

@@ -723,11 +723,14 @@ near-complete reference lists, checked document types and subject categories, an
 They are paid (or need a subscription) and have their own gaps and counting rules.
 
 **The "Sources agree?" column**
-- We download every paper from *both* sources, match them by DOI, and compare year (a 1-year gap is tolerated:
-  online-first vs print issue), volume, issue, first page, title and number of authors.
-  ✅ = both agree, ⚠️ = they conflict (the dialog for the paper shows exactly where), ◻ = only one source has it.
+- We download every paper from OpenAlex and Crossref (and Scopus too, if you've set that up), match them by DOI,
+  and compare year (a 1-year gap is tolerated: online-first vs print issue), volume, issue, first page, title and
+  number of authors. ✅ = the sources present agree, ⚠️ = they conflict (the dialog for the paper shows exactly
+  where), ◻ = at least one source doesn't have this paper. The label names which sources it's talking about
+  ("OpenAlex & Crossref agree", "OpenAlex only", ...) - it only ever means "the sources that are actually in play
+  for this paper", never a fixed count, so it stays honest once Scopus is added on top of the other two.
 - Agreement is a *useful hint, not proof*: OpenAlex re-uses a lot of Crossref's metadata, so the two are **not
-  independent**. Two matching wrong values are still wrong. Where only one source has the paper, treat it with more care.
+  independent**. Two matching wrong values are still wrong. Where a source is missing the paper, treat it with more care.
 - Citation counts are shown side by side and are never used for the agree / conflict flag.
 - Missing fields in OpenAlex are filled from Crossref when Crossref has them.
 
@@ -798,6 +801,49 @@ STATE = {"types": set(DEFAULT_ON), "journals": set(), "check": "", "q": "", "yea
          "chains": {f: [] for f in CHAIN_LABELS}, "sources": set(ALL_SOURCES),
          "busy": False, "error": "", "started": 0.0, "jobs": {}}
 
+# Which STATE fields are a "your setup" choice worth remembering across restarts (not "types"/"sources"/"chains" -
+# see load_view/save_view - and never the transient download-status ones like "busy"/"jobs").
+VIEW_KEYS = ("types", "journals", "check", "q", "years", "sources", "chains")
+
+
+def load_view() -> None:
+    """Restore the filters/conditions from last time, if any were saved. Runs once at startup, after STATE's
+    defaults are already set, so anything missing or malformed in an old/hand-edited config file just falls back
+    to those defaults instead of crashing the app."""
+    saved = CONFIG.get("view")
+    if not saved:
+        return
+    try:
+        if "types" in saved:
+            STATE["types"] = set(saved["types"])
+        if "journals" in saved:
+            STATE["journals"] = set(saved["journals"])
+        if "sources" in saved:
+            STATE["sources"] = set(saved["sources"]) & ALL_SOURCES or set(ALL_SOURCES)
+        if "check" in saved:
+            STATE["check"] = saved["check"]
+        if "q" in saved:
+            STATE["q"] = saved["q"]
+        if "years" in saved:
+            lo, hi = saved["years"]["min"], saved["years"]["max"]
+            STATE["years"] = {"min": max(YB[0], min(lo, YB[1])), "max": min(YB[1], max(hi, YB[0]))}  # clamped to
+        if "chains" in saved:                                                                         # today's data
+            STATE["chains"] = {f: saved["chains"].get(f, []) for f in CHAIN_LABELS}
+    except Exception as e:
+        log.warning("view: could not restore the saved filters (%s) - using defaults", e)
+
+
+def save_view() -> None:
+    """Write the current filters/conditions to disk so they're still set next time the app opens. Called from
+    `changed()`, i.e. on every filter edit - it's a small JSON write, cheap enough not to debounce separately."""
+    CONFIG["view"] = {
+        "types": sorted(STATE["types"]), "journals": sorted(STATE["journals"]), "sources": sorted(STATE["sources"]),
+        "check": STATE["check"], "q": STATE["q"], "years": dict(STATE["years"]), "chains": STATE["chains"]}
+    save_config(CONFIG)
+
+
+load_view()
+
 
 def has_scopus_data() -> bool:
     return not DF.empty and DF["ScopusCheck"].fillna("").ne("").any()
@@ -812,6 +858,45 @@ def source_mask(d: pd.DataFrame, source: str) -> pd.Series:
     if source == "Crossref":
         return d["Sources"].isin(["Both", "Crossref only"])
     return ~d["ScopusCheck"].fillna("").isin(["", "\u25fb Not in Scopus"])   # Scopus
+
+
+def combined_check(d: pd.DataFrame) -> pd.Series:
+    """The overall 'how much do the sources agree' label for the grid/filter/Excel-of-a-selection - honest about
+    HOW MANY sources are actually in play. Without Scopus this is just the original OpenAlex/Crossref comparison
+    (unchanged, zero difference for anyone who hasn't touched Scopus); once Scopus is part of the picture, "Both
+    agree" stops meaning anything - there might be three sources now - so all of them get folded into one label
+    instead of leaving Scopus sitting in its own easy-to-miss column."""
+    oa_cr, sc = d["Check"].fillna(""), d["ScopusCheck"].fillna("")
+    if not has_scopus_data():
+        return oa_cr
+    in_oa, in_cr, in_sc = source_mask(d, "OpenAlex"), source_mask(d, "Crossref"), source_mask(d, "Scopus")
+    n_present = in_oa.astype(int) + in_cr.astype(int) + in_sc.astype(int)
+    names = pd.Series([[]] * len(d), index=d.index)               # e.g. ["OpenAlex", "Scopus"] per row
+    for mask, label in ((in_oa, "OpenAlex"), (in_cr, "Crossref"), (in_sc, "Scopus")):
+        names = names + mask.map(lambda ok, label=label: [label] if ok else [])
+    joined = names.map(" & ".join)
+    conflict = oa_cr.str.startswith("\u26a0") | sc.str.startswith("\u26a0")
+    agrees = (oa_cr == "\u2705 Both agree") | sc.str.startswith("\u2705")
+
+    out = pd.Series("\u25fb not found in any source", index=d.index)
+    out = out.mask(n_present == 1, "\u25fb " + joined + " only")
+    out = out.mask((n_present >= 2) & ~agrees, "\u25fb " + joined + " - nothing to compare")
+    out = out.mask((n_present >= 2) & agrees, "\u2705 " + joined + " agree")
+
+    # Conflicts are rare (well under 1% of papers in our own testing), so building the readable detail text with
+    # .apply() only on that small subset costs nothing - the fast vectorized path above covers everything else.
+    if conflict.any():
+        def detail(i):
+            bits = []
+            if oa_cr.loc[i].startswith("\u26a0"):
+                bits.append(oa_cr.loc[i].split("Conflict: ", 1)[-1])
+            if sc.loc[i].startswith("\u26a0"):
+                bits.append("Scopus: " + sc.loc[i].split(": ", 1)[-1])
+            return "\u26a0\ufe0f Conflict: " + "; ".join(bits)
+        out.loc[conflict] = [detail(i) for i in d.index[conflict]]
+    return out
+
+
 # State that only belongs to the Explore tab (the slot machine).
 EX = {"picks": [], "dirty": True, "surprise": 0.6, "min_papers": 2, "next_op": "AND", "chart_mode": "count", "kw_mode": "most", "pdf_abs": True}
 
@@ -879,6 +964,8 @@ def filtered(skip: tuple = ()) -> pd.DataFrame:
     d = d[d["Type"].isin(STATE["types"])]
     if STATE["journals"]:
         d = d[d["Journal"].isin(STATE["journals"])]
+    if has_scopus_data():                                         # fold Scopus into "Check" for filtering/display -
+        d = d.assign(Check=combined_check(d))                      # "Both agree" stops meaning anything otherwise
     if STATE["check"]:                                           # confidence filter (see Check column)
         d = d[d["Check"].fillna("").str.startswith(STATE["check"])]
     if (STATE["years"]["min"], STATE["years"]["max"]) != YB:     # only when narrowed, so papers without a year stay in
@@ -1067,6 +1154,7 @@ def main_page():
 
     def changed():                                                # any filter changed
         EX["dirty"] = True
+        save_view()                                               # remember it for next time you open the app
         refresh_views()
 
     def reload_data():
@@ -1277,8 +1365,8 @@ def main_page():
                     ui.label("Years").classes("text-caption")
                     ui.range(min=YB[0], max=YB[1], value=dict(STATE["years"]),
                              on_change=lambda e: (STATE.update(years=dict(e.value)), changed())).props("label-always")
-                ui.select({"": "All records", "✅": "✅ Both sources agree", "⚠": "⚠️ Sources conflict",
-                           "◻": "◻ Only one source"}, value=STATE["check"], label="Sources agree?",
+                ui.select({"": "All records", "✅": "✅ Sources agree", "⚠": "⚠️ Sources conflict",
+                           "◻": "◻ Not all sources have it"}, value=STATE["check"], label="Sources agree?",
                           on_change=lambda e: (STATE.update(check=e.value), changed())).props("outlined dense").classes("w-52")
             with ui.row().classes("items-center gap-1"):
                 ui.label("Paper types:").classes("text-caption")
@@ -1304,8 +1392,8 @@ def main_page():
             ui.select({j["abbr"]: j["name"] for j in CONFIG["journals"]}, multiple=True, value=sorted(STATE["journals"]),
                       label="Journals (all)", on_change=lambda e: (STATE.update(journals=set(e.value)), changed())
                       ).props("outlined dense use-chips").classes("w-72")
-        ui.select({"": "All records", "\u2705": "\u2705 Both sources agree", "\u26a0": "\u26a0\ufe0f Sources conflict",
-                   "\u25fb": "\u25fb Only one source"}, value=STATE["check"], label="Confidence",
+        ui.select({"": "All records", "\u2705": "\u2705 Sources agree", "\u26a0": "\u26a0\ufe0f Sources conflict",
+                   "\u25fb": "\u25fb Not all sources have it"}, value=STATE["check"], label="Confidence",
                   on_change=lambda e: (STATE.update(check=e.value), changed())).props("outlined dense").classes("w-56")
         with ui.row().classes("items-center gap-1"):
             ui.label("Show:").classes("text-caption")
