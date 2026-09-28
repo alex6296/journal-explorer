@@ -1,13 +1,16 @@
-# Builds the app for Windows AND Mac on GitHub's free build machines (PyInstaller cannot cross-compile,
-# so each OS has to be built on that OS). Run it from the repo's "Actions" tab -> "Build" -> "Run workflow",
-# then download the two zips from the finished run's "Artifacts" section.
+# Builds the app for Windows and both Mac architectures on GitHub's free build machines (PyInstaller cannot
+# cross-compile, so each OS/architecture has to be built on that OS/architecture - there's no single "Mac" build).
+# Run it from the repo's "Actions" tab -> "Build" -> "Run workflow", then download the artifacts from the
+# finished run's "Artifacts" section (or use the same `gh run download <run-id>` pattern used to update the repo).
 name: Build
 on: workflow_dispatch
 jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        # macos-latest = Apple Silicon (arm64, M1 and later). macos-15-intel = Intel Macs (GitHub retired the
+        # plain "macos-13" Intel label in Dec 2025; this is its replacement, supported through Fall 2027).
+        os: [windows-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
