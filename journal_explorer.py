@@ -36,7 +36,7 @@ import pandas as pd
 import requests
 import xlsxwriter   # noqa: F401  (pandas loads it by name; the import makes the exe bundle it)
 import reportlab    # noqa: F401  (used inside export_pdf; the import makes the exe bundle it)
-from nicegui import run, ui
+from nicegui import app, run, ui
 from pyalex import Sources, Works
 
 # ----------------------------------------------------------------------------------------------
@@ -45,6 +45,10 @@ from pyalex import Sources, Works
 # When packaged into an exe, files must go NEXT TO the exe (not inside its temp folder).
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 DATA_DIR = APP_DIR / "data"          # one .pkl per journal + the settings file
+# The tutorial video ships INSIDE the exe/app (PyInstaller's --add-data unpacks it to a temp folder at
+# sys._MEIPASS when frozen); when just running the .py directly it is the plain "assets" folder next to it.
+ASSETS_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets"
+app.add_media_files("/tutorial", ASSETS_DIR)      # add_media_files (not add_static_files) supports video seeking
 DATA_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DATA_DIR / "journals.json"
 EXCEL_FILE = APP_DIR / "Journals.xlsx"
@@ -249,16 +253,23 @@ class ElsevierQuotaError(Exception):
         super().__init__(f"quota exhausted, resets {reset_at}")
 
 
+ELS_START_CAP = 5000           # Scopus Search's documented offset ("start") pagination stops here; see the note below
+
+
 def elsevier_rows(j: dict, progress) -> dict[str, dict]:
-    """Every paper of one journal from the Scopus Search API, keyed by lower-case DOI. Cursor pagination (not
-    offset) so journals over 5,000 results still work. One request at a time, paced to Elsevier's own guidance,
-    and we stop well before the weekly quota would actually run out."""
+    """Every paper of one journal from the Scopus Search API, keyed by lower-case DOI. Uses `start`/`count` offset
+    paging - the one pagination method the official WADL spec actually documents. (An earlier version used the
+    `cursor` parameter instead, which several client libraries use for subscriber accounts, but it isn't in the
+    spec and returned a plain 400 Bad Request here - `start` is the documented, reliable way.) Its trade-off:
+    Scopus refuses any `start` past 5,000, so a journal with more results than that is capped; STATE["elsevier_capped"]
+    records it so the UI can say so rather than silently under-counting.
+    One request at a time, paced to Elsevier's own guidance, and we stop well before the weekly quota runs out."""
     key = (CONFIG.get("elsevier_key") or "").strip()
     if not key:
         return {}
     headers = {"X-ELS-APIKey": key, "Accept": "application/json"}
     out: dict[str, dict] = {}
-    cursor, total, last_call = "*", None, 0.0
+    start, total, last_call = 0, None, 0.0
     while True:
         wait = ELS_PACE_SECONDS - (time.time() - last_call)
         if wait > 0:
@@ -266,7 +277,7 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
         last_call = time.time()
         try:
             r = requests.get("https://api.elsevier.com/content/search/scopus", headers=headers, timeout=30,
-                              params={"query": f"ISSN({j['issn']})", "count": 100, "cursor": cursor, "view": "STANDARD"})
+                              params={"query": f"ISSN({j['issn']})", "count": 100, "start": start, "view": "STANDARD"})
         except requests.exceptions.RequestException as e:
             raise ElsevierGatedError(f"could not reach Elsevier ({e})") from e
         if r.status_code == 429 or r.headers.get("X-ELS-Status") == "QUOTA_EXCEEDED":
@@ -275,6 +286,9 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
             raise ElsevierQuotaError(reset_at)
         if r.status_code in (401, 403):
             raise ElsevierGatedError(f"HTTP {r.status_code} - the key was rejected")
+        if r.status_code == 400:
+            raise ElsevierGatedError(f"HTTP 400 from Scopus - the query it received: ISSN({j['issn']}) "
+                                      f"(response: {r.text[:200]})")
         r.raise_for_status()
         remaining = r.headers.get("X-RateLimit-Remaining")
         msg = r.json().get("search-results", {})
@@ -295,23 +309,26 @@ def elsevier_rows(j: dict, progress) -> dict[str, dict]:
                 "BP": pages[0] or None, "n_auth": None,             # standard view has no full author count
                 "TC": int(e["citedby-count"]) if e.get("citedby-count") not in (None, "") else None,
                 "eid": e.get("eid")}
-        progress(j["abbr"], "sc", len(out), total or len(out))
-        nxt = ((msg.get("cursor") or {}).get("@next"))
-        if not entries or not nxt or nxt == cursor or len(out) >= total:
+        progress(j["abbr"], "sc", len(out), min(total, ELS_START_CAP) or len(out))
+        start += len(entries)
+        if not entries or len(out) >= total:
             return out
-        cursor = nxt
+        if start >= ELS_START_CAP:
+            STATE.setdefault("elsevier_capped", {})[j["abbr"]] = (len(out), total)
+            return out
         if remaining is not None and int(remaining) <= ELS_QUOTA_FLOOR:
             return out                                              # stop with what we have rather than risk a 429
 
 
 def test_elsevier_key(key: str) -> str:
-    """One lightweight request, used by the Settings 'Test key' button. Returns a short, human result string, or
-    raises ElsevierGatedError / ElsevierQuotaError, which the caller turns into the explanatory pop-up."""
-    small_journal = min(CONFIG["journals"], key=lambda j: j.get("works_count") or 1e9) if CONFIG["journals"] else \
-        {"issn": "2333-2050", "name": "Strategy Science"}
+    """One lightweight request, used by the Settings 'Test key' button. Always queries the same small, fixed journal
+    (Strategy Science) rather than trying to guess the smallest of the user's tracked ones - the default four don't
+    carry a `works_count` to compare, which used to make this silently query SMJ (4,500+ results) instead. Returns a
+    short, human result string, or raises ElsevierGatedError / ElsevierQuotaError for the caller's pop-up."""
+    test_journal = {"issn": "2333-2050", "name": "Strategy Science"}
     r = requests.get("https://api.elsevier.com/content/search/scopus", timeout=20,
                       headers={"X-ELS-APIKey": key.strip(), "Accept": "application/json"},
-                      params={"query": f"ISSN({small_journal['issn']})", "count": 1})
+                      params={"query": f"ISSN({test_journal['issn']})", "count": 1})
     if r.status_code == 429 or r.headers.get("X-ELS-Status") == "QUOTA_EXCEEDED":
         reset = r.headers.get("X-RateLimit-Reset")
         raise ElsevierQuotaError(datetime.fromtimestamp(int(reset)).strftime("%Y-%m-%d %H:%M") if reset else "next week")
@@ -323,7 +340,7 @@ def test_elsevier_key(key: str) -> str:
         raise ElsevierGatedError("Scopus reports results but returns none - this key is probably not recognized as "
                                   "belonging to a subscribing institution from this network")
     remaining = r.headers.get("X-RateLimit-Remaining", "?")
-    return f"Key works. Scopus lists {total:,} papers for {small_journal['name']} ({remaining} search requests left this week)."
+    return f"Key works. Scopus lists {total:,} papers for {test_journal['name']} ({remaining} search requests left this week)."
 
 
 def scopus_check(row: dict, s: dict) -> tuple[str | None, str | None]:
@@ -863,7 +880,7 @@ def progress(abbr: str, source: str, done: int, total: int) -> None:
 def download_all(journals: list[dict]) -> None:
     """Runs in a background thread so the page stays responsive."""
     use_scopus = bool((CONFIG.get("elsevier_key") or "").strip()) and CONFIG.get("elsevier_enabled") and CONFIG.get("elsevier_verified")
-    STATE.update(busy=True, error="", started=time.time(), elsevier_notice=None,
+    STATE.update(busy=True, error="", started=time.time(), elsevier_notice=None, elsevier_capped={},
                  jobs={j["abbr"]: {"name": j["name"], "oa": [0, 0], "cr": [0, 0], "state": "waiting",
                                     **({"sc": [0, 0]} if use_scopus else {})} for j in journals})
     try:
@@ -904,12 +921,29 @@ def main_page():
                             "belonging to a subscribing institution. **This almost always means:**\n\n"
                             "- try your **school or work network** directly (not a home connection), or\n"
                             "- turn on your institution's **VPN**, then press **Update data** again\n\n"
-                            "If that still doesn't work, double-check the key under **Journals -> Settings**.")
+                            "If that still doesn't work, double-check the key under **Settings**.")
             else:
                 ui.markdown(f"Your Elsevier key's weekly search quota is used up. It resets around **{err.reset_at}**. "
                            "OpenAlex and Crossref downloaded normally - only the Scopus cross-check was skipped.")
             ui.label(f"Technical detail: {err}").classes("text-caption text-grey-7")
             ui.button("OK", on_click=dlg.close).props("color=primary")
+        dlg.open()
+
+    def offer_scopus_pull():
+        """Shown right after a key passes its test - the prominent, hard-to-miss call to action, not just a small
+        checkbox somewhere on the Settings tab."""
+        update_btn.props(remove="flat").props("unelevated color=primary")
+        update_btn.set_text("Update data (with Scopus)")
+        with ui.dialog() as dlg, ui.card().classes("w-[560px] max-w-full items-center gap-3 q-pa-lg"):
+            ui.icon("check_circle", size="56px", color="positive")
+            ui.label("Scopus key verified").classes("text-h5")
+            ui.label("Re-download your journals now to add the Scopus cross-check to every paper - "
+                     "takes a few minutes.").classes("text-body1 text-center")
+            with ui.row().classes("gap-3"):
+                ui.button("Update data now (with Scopus)", icon="cloud_download",
+                          on_click=lambda: (dlg.close(), run_download(list(CONFIG["journals"])))).props(
+                    "unelevated color=primary size=lg no-caps")
+                ui.button("Later", on_click=dlg.close).props("flat no-caps")
         dlg.open()
 
     def show_about():
@@ -1004,6 +1038,10 @@ def main_page():
             ui.notify("Download finished", type="positive")
         if STATE.get("elsevier_notice"):
             show_elsevier_notice(STATE["elsevier_notice"])
+        elif STATE.get("elsevier_capped"):
+            lines = "; ".join(f"{a}: got {n:,} of {t:,}" for a, (n, t) in STATE["elsevier_capped"].items())
+            ui.notify(f"Scopus caps results at 5,000 per journal - {lines}. Everything else downloaded in full.",
+                      type="warning", multi_line=True, close_button=True, timeout=0)
         reload_data()
 
     async def do_pdf():
@@ -1354,8 +1392,6 @@ def main_page():
     # =============================== header ===============================
     with ui.header().classes("items-center gap-4"):
         ui.label("Journal Explorer").classes("text-h6")
-        ui.space()
-        ui.button("Update data", icon="sync", on_click=lambda: run_download(list(CONFIG["journals"]))).props("flat color=white")
 
         async def do_export():
             if EXPORT_LOCK.locked():                              # a second click must not disturb the running export
@@ -1374,9 +1410,6 @@ def main_page():
             note.dismiss()
             ui.download(path)
             ui.notify(f"Saved {path}", type="positive")
-
-        export_btn = ui.button("Export to Excel", icon="download", on_click=do_export).props("flat color=white")
-        ui.button("About this data", icon="info", on_click=show_about).props("flat color=white")
 
     @ui.refreshable
     def empty_state():
@@ -1399,11 +1432,17 @@ def main_page():
         filters.refresh(); papers_filters.refresh()               # both tabs re-read the shared state
         refresh_views()
 
-    with ui.tabs().classes("w-full") as tabs:
-        ui.tab("Papers", icon="table_rows")
-        ui.tab("Explore", icon="casino")
-        ui.tab("Journals", icon="library_books")
-        ui.tab("Settings", icon="settings")
+    with ui.row().classes("w-full items-center no-wrap q-px-sm").style("background: white"):
+        with ui.tabs() as tabs:
+            ui.tab("Papers", icon="table_rows")
+            ui.tab("Explore", icon="casino")
+            ui.tab("Journals", icon="library_books")
+            ui.tab("Settings", icon="settings")
+        ui.space()
+        update_btn = ui.button("Update data", icon="sync",
+                               on_click=lambda: run_download(list(CONFIG["journals"]))).props("flat dense no-caps")
+        export_btn = ui.button("Export to Excel", icon="download", on_click=do_export).props("flat dense no-caps")
+        ui.button("About this data", icon="info", on_click=show_about).props("flat dense no-caps")
 
     with ui.tab_panels(tabs, value="Papers", on_change=on_tab).classes("w-full").style("background: transparent"):
         with ui.tab_panel("Papers"):
@@ -1428,29 +1467,14 @@ def main_page():
                         "own citation count. Left blank, nothing changes: the app works exactly as before.").classes("text-body2")
             with ui.row().classes("items-center gap-1"):
                 ui.label("Get a free key at")
-                ui.link("dev.elsevier.com/apikey/manage", "https://dev.elsevier.com/apikey/manage", new_tab=True)
+                ui.link("dev.elsevier.com/apikey/create", "https://dev.elsevier.com/apikey/create", new_tab=True)
             ui.label("It only returns full results from your institution's network (or its VPN), even once the key "
                     "itself is valid - that's Elsevier's own gating, not a bug here.").classes("text-caption text-grey-7")
+            # A paste/type here tests itself automatically (debounced, so it waits for you to stop typing) - no
+            # separate button to remember to press. The manual button below still works too, e.g. to retry after
+            # switching networks.
             key_input = ui.input("Elsevier API key", value=CONFIG.get("elsevier_key", ""), password=True,
-                                 password_toggle_button=True).props("outlined dense clearable").classes("w-96")
-
-            def unverify(*_):                                     # any edit to the key invalidates the last test
-                if CONFIG.get("elsevier_verified"):
-                    CONFIG["elsevier_verified"] = False
-                    CONFIG["elsevier_enabled"] = False
-                    enable_box.value = False
-                    enable_box.enabled = False
-                    save_config(CONFIG)
-            key_input.on("input", unverify)
-
-            def save_key():
-                CONFIG["elsevier_key"] = key_input.value or ""
-                save_config(CONFIG)
-                if not CONFIG["elsevier_key"]:
-                    CONFIG.update(elsevier_enabled=False, elsevier_verified=False)
-                    enable_box.value, enable_box.enabled = False, False
-                    save_config(CONFIG)
-            key_input.on("blur", save_key)
+                                 password_toggle_button=True).props("outlined dense clearable debounce=900").classes("w-96")
 
             def toggle_enabled(e):
                 CONFIG["elsevier_enabled"] = e.value
@@ -1460,27 +1484,41 @@ def main_page():
             enable_box = ui.checkbox("Also cross-check against Scopus on the next 'Update data'",
                                      value=CONFIG.get("elsevier_enabled", False), on_change=toggle_enabled)
             enable_box.enabled = bool(CONFIG.get("elsevier_verified"))
-            lock_note = ui.label("" if enable_box.enabled else "Test the key successfully first - see below.").classes("text-caption text-warning")
+            lock_note = ui.label("" if enable_box.enabled else "Type a key above - it is tested automatically.").classes("text-caption text-warning")
             test_result = ui.label().classes("text-caption")
 
+            def unverify():
+                CONFIG["elsevier_verified"], CONFIG["elsevier_enabled"] = False, False
+                enable_box.value, enable_box.enabled = False, False
+                lock_note.text = "Type a key above - it is tested automatically."
+                save_config(CONFIG)
+
             async def test_key():
-                if not key_input.value:
-                    ui.notify("Enter a key first.", type="warning")
+                val = (key_input.value or "").strip()
+                CONFIG["elsevier_key"] = val
+                save_config(CONFIG)
+                if not val:
+                    unverify(); lock_note.text, test_result.text = "", ""
                     return
-                save_key()
-                test_result.text = "Testing..."
+                unverify()                                        # any (re)test starts from "unverified" - a failed
+                test_result.text = "Testing the key..."            # retest can never leave a stale checkmark showing
                 try:
-                    msg = await run.io_bound(test_elsevier_key_wrapper, key_input.value)
+                    msg = await run.io_bound(test_elsevier_key_wrapper, val)
                     test_result.text = msg
                     CONFIG["elsevier_verified"], CONFIG["elsevier_enabled"] = True, True   # verified -> switch it on
                     save_config(CONFIG)
                     enable_box.enabled, enable_box.value, lock_note.text = True, True, ""
+                    offer_scopus_pull()                             # the prominent "do it now" prompt
                 except (ElsevierGatedError, ElsevierQuotaError) as e:
                     test_result.text = ""
                     show_elsevier_notice(e)
                 except Exception as e:
                     test_result.text = f"Could not reach Elsevier: {e}"
+            key_input.on_value_change(lambda e: test_key())
             ui.button("Test key", icon="wifi_tethering", on_click=test_key).props("outline no-caps color=primary")
+            ui.separator()
+            ui.label("How to get and use a key").classes("text-subtitle2")
+            ui.video("/tutorial/elsevier_tutorial.mp4", controls=True).classes("w-full max-w-[720px]").style("border-radius: 8px")
             ui.separator()
             ui.markdown("**Elsevier's terms:** a Scopus corpus pulled with your key is *personal to you* and "
                         "should not be handed to other people - that includes this app's `data` folder and any "
