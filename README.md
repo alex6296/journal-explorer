@@ -34,8 +34,17 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
 ## Run it
 
 **Windows, no install:** download [`JournalExplorer.exe`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer.exe)
-(it is in the root of this repository, 79 MB) and double-click it. Press **Download papers** on first start. Windows may show
-"More info -> Run anyway" because the exe is not code-signed. The exe is rebuilt by hand, so it can lag behind the source.
+(root of this repo, 79 MB) and double-click it. Press **Download papers** on first start. Windows may show "More info -> Run anyway"
+because the exe is not code-signed.
+
+**Mac (Apple Silicon - M1/M2/M3/M4, not Intel Macs):** download both
+[`JournalExplorer-mac`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-mac) and
+[`Start JournalExplorer (Mac).command`](<https://github.com/alex6296/journal-explorer/raw/main/Start JournalExplorer (Mac).command>)
+into the same folder, then double-click the `.command` file. The first time, macOS will refuse to open it as an
+"unidentified developer" - right-click it (or `JournalExplorer-mac`) and choose **Open** once, confirm, and it runs
+normally after that.
+
+Both builds are rebuilt by hand (or via `.github/workflows/build.yml` on GitHub Actions), so they can lag behind the source.
 
 **From source** (Windows, Mac or Linux, Python 3.11+):
 
