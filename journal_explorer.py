@@ -793,9 +793,25 @@ YB = year_bounds()
 
 # ONE shared filter state: the Papers tab, the Explore tab, the charts and the pop-up editors all read and write this,
 # so they can never disagree. "chains" hold the conditions (joined by AND / OR, as many as you like) per text field.
+ALL_SOURCES = {"OpenAlex", "Crossref", "Scopus"}       # which sources a paper is allowed to have come from
 STATE = {"types": set(DEFAULT_ON), "journals": set(), "check": "", "q": "", "years": {"min": YB[0], "max": YB[1]},
-         "chains": {f: [] for f in CHAIN_LABELS},
+         "chains": {f: [] for f in CHAIN_LABELS}, "sources": set(ALL_SOURCES),
          "busy": False, "error": "", "started": 0.0, "jobs": {}}
+
+
+def has_scopus_data() -> bool:
+    return not DF.empty and DF["ScopusCheck"].fillna("").ne("").any()
+
+
+def source_mask(d: pd.DataFrame, source: str) -> pd.Series:
+    """Which papers were actually found by one source - not which sources you've downloaded overall, but whether
+    THIS paper is in them. OpenAlex/Crossref presence comes from the Sources column merge() already writes;
+    Scopus presence is "ScopusCheck is anything other than blank or 'Not in Scopus'"."""
+    if source == "OpenAlex":
+        return d["Sources"].isin(["Both", "OpenAlex only"])
+    if source == "Crossref":
+        return d["Sources"].isin(["Both", "Crossref only"])
+    return ~d["ScopusCheck"].fillna("").isin(["", "\u25fb Not in Scopus"])   # Scopus
 # State that only belongs to the Explore tab (the slot machine).
 EX = {"picks": [], "dirty": True, "surprise": 0.6, "min_papers": 2, "next_op": "AND", "chart_mode": "count", "kw_mode": "most", "pdf_abs": True}
 
@@ -868,6 +884,11 @@ def filtered(skip: tuple = ()) -> pd.DataFrame:
     if (STATE["years"]["min"], STATE["years"]["max"]) != YB:     # only when narrowed, so papers without a year stay in
         year = pd.to_numeric(d["PY"], errors="coerce")
         d = d[(year >= STATE["years"]["min"]) & (year <= STATE["years"]["max"])]
+    if STATE["sources"] != ALL_SOURCES:                           # only when narrowed, so this stays a no-op by default
+        mask = pd.Series(False, index=d.index)
+        for src in STATE["sources"]:
+            mask |= source_mask(d, src)
+        d = d[mask]
     for term in STATE["q"].lower().split():
         d = d[d["_search"].str.contains(term, regex=False)]
     for field, chain in STATE["chains"].items():
@@ -1218,6 +1239,17 @@ def main_page():
                 ui.button("Done", on_click=dlg.close).props("color=primary")
         dlg.open()
 
+    def source_checkboxes():
+        """Toggle which source(s) a paper must have been found by. All three on = no filter (everyone's default)."""
+        with ui.row().classes("items-center gap-1"):
+            ui.label("Sources:").classes("text-caption")
+            options = ["OpenAlex", "Crossref"] + (["Scopus"] if has_scopus_data() else [])
+            for src in options:
+                def toggle(e, src=src):
+                    STATE["sources"].add(src) if e.value else STATE["sources"].discard(src)
+                    changed()
+                ui.checkbox(src, value=src in STATE["sources"], on_change=toggle)
+
     def chain_widget(field: str):
         with ui.row().classes("items-center gap-1 no-wrap"):
             ui.label(CHAIN_LABELS[field] + ":").classes("text-caption text-bold")
@@ -1255,6 +1287,7 @@ def main_page():
                         STATE["types"].add(t) if e.value else STATE["types"].discard(t)
                         changed()
                     ui.checkbox(t, value=t in STATE["types"], on_change=toggle)
+            source_checkboxes()
             with ui.row().classes("items-center gap-6"):
                 for field in CHAIN_LABELS:
                     if show_keywords or field != "keywords":
@@ -1281,6 +1314,7 @@ def main_page():
                     STATE["types"].add(t) if e.value else STATE["types"].discard(t)
                     changed()
                 ui.checkbox(t, value=t in STATE["types"], on_change=toggle)
+        source_checkboxes()
 
     def reset_years():
         STATE["years"] = {"min": YB[0], "max": YB[1]}

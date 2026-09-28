@@ -15,7 +15,9 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
   *Long Range Planning*, *Strategic Organization* and *Strategy Science*.
 - **Cross-check** the two sources paper by paper. Each paper is marked: both agree, they conflict (and on which field), or
   only one source has it.
-- **Papers tab:** search, sort, and filter by journal, years, paper type and source agreement. Text filters (title,
+- **Papers tab:** search, sort, and filter by journal, years, paper type, source agreement, and which source(s) a
+  paper must have been found by (e.g. only papers that are in Scopus) - the same filter is on the Explore tab too.
+  Text filters (title,
   authors, keywords, abstract) take **any number of conditions** - Contains, Does not contain, Equals, Does not equal, Begins with,
   Ends with, Blank, Not blank - joined by AND / OR and edited in a pop-up list.
 - **Explore tab:** a keyword "slot machine" for finding ideas. Lock a keyword, shuffle to get 10 keywords from papers that
