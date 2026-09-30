@@ -18,6 +18,43 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -r requirements.txt
       - run: nicegui-pack --onefile --name JournalExplorer --add-data "assets${{ matrix.os == 'windows-latest' && ';' || ':' }}assets" journal_explorer.py
+
+      # macOS only, from here down: wrap the binary in a real .app bundle and ad-hoc code-sign it. Ad-hoc (`-s -`)
+      # needs no Apple Developer account and isn't the same as full notarization - Gatekeeper will still ask to
+      # confirm the first launch - but an entirely unsigned Mach-O is what tends to get flagged outright as
+      # "damaged" on current macOS, so a real (if self-issued) signature is worth having. Built here, on the
+      # actual macOS runner, so codesign/ditto are the real Apple tools, not something faked from another OS.
+      - name: Build a signed .app bundle (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          APP="dist/JournalExplorer.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mv dist/JournalExplorer "$APP/Contents/MacOS/JournalExplorer"
+          chmod +x "$APP/Contents/MacOS/JournalExplorer"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key><string>JournalExplorer</string>
+              <key>CFBundleIdentifier</key><string>com.journalexplorer.app</string>
+              <key>CFBundleName</key><string>Journal Explorer</string>
+              <key>CFBundleDisplayName</key><string>Journal Explorer</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1.0</string>
+              <key>LSMinimumSystemVersion</key><string>11.0</string>
+              <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"    # fail the build if the signature isn't valid
+          spctl --assess --type execute "$APP" || echo "spctl: not Gatekeeper-approved (expected for an ad-hoc, unnotarized signature) - this is informational, not a build failure"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/JournalExplorer-${{ matrix.os }}.app.zip"
+          rm -rf "$APP"
+
       - uses: actions/upload-artifact@v4
         with:
           name: JournalExplorer-${{ matrix.os }}
