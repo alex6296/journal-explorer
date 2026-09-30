@@ -53,21 +53,35 @@ Runs on your own computer in a browser tab. Free data sources, no login, no API 
 because the exe is not code-signed.
 
 **Mac:** two separate builds - PyInstaller can't make one file that runs on both. Not sure which you have? Apple menu
--> **About This Mac**: it says "Chip" (Apple M1/M2/M3/M4 -> Apple Silicon) or "Processor" (Intel -> Intel).
+-> **About This Mac**: it says "Chip" (Apple M1/M2/M3/M4 -> Apple Silicon) or "Processor" (Intel -> Intel). Both `.app`
+builds are ad-hoc code-signed during the build (via `codesign` and `ditto`, on GitHub's own macOS runners) - that's
+not the same as full Apple notarization (which needs a paid $99/year Developer account), so Gatekeeper still won't
+outright approve it, but it's a real signature rather than none, which is what tends to avoid the harsher **"is
+damaged and should be moved to the Trash"** message some unsigned Mac apps get on current macOS. Either way, expect
+*some* first-launch prompt - see below.
 
 - **Apple Silicon (M1 and later) - one file:** download
   [`JournalExplorer-Mac-AppleSilicon.app.zip`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-Mac-AppleSilicon.app.zip),
   unzip it (double-click, or Finder does it automatically for a downloaded zip) and double-click the `JournalExplorer.app`
-  it makes, like any other Mac app. Same binary as the two-file option below, just wrapped as a real `.app`
-  bundle so there's only one thing to send someone.
+  it makes, like any other Mac app.
   *(Two-file alternative, if you'd rather not unzip: download both
   [`JournalExplorer-mac`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-mac) and
   [`Start JournalExplorer (Mac Apple Silicon).command`](<https://github.com/alex6296/journal-explorer/raw/main/Start JournalExplorer (Mac Apple Silicon).command>)
   into the same folder and double-click the `.command` file.)*
-- **Intel:** download both
+- **Intel - one file:** download
+  [`JournalExplorer-Mac-Intel.app.zip`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-Mac-Intel.app.zip),
+  unzip it and double-click the `JournalExplorer.app` it makes.
+  *(Two-file alternative: download both
   [`JournalExplorer-mac-intel`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-mac-intel) and
   [`Start JournalExplorer (Mac Intel).command`](<https://github.com/alex6296/journal-explorer/raw/main/Start JournalExplorer (Mac Intel).command>)
-  into the same folder, then double-click the `.command` file.
+  into the same folder and double-click the `.command` file.)*
+
+**If macOS says it "can't be opened" or "is damaged":** this is Gatekeeper, not a broken download. Try, in order:
+right-click (Control-click) the app -> **Open** -> confirm **Open** in the dialog; if that doesn't work or the app
+was already refused once, go to **System Settings -> Privacy & Security**, scroll down to the blocked-app message,
+and click **Open Anyway** (this button disappears after about an hour, so do it soon after the first failed
+attempt); if neither works, open Terminal and run `xattr -cr` followed by a space, then drag the `.app` into the
+Terminal window to fill in its path, and press Enter - that strips the quarantine flag entirely.
 
 Either way, the first time macOS will refuse to open it as an "unidentified developer" - right-click it (the `.command`
 file or the plain binary) and choose **Open** once, confirm, and it runs normally after that.
