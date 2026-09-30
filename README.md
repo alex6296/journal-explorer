@@ -55,10 +55,15 @@ because the exe is not code-signed.
 **Mac:** two separate builds - PyInstaller can't make one file that runs on both. Not sure which you have? Apple menu
 -> **About This Mac**: it says "Chip" (Apple M1/M2/M3/M4 -> Apple Silicon) or "Processor" (Intel -> Intel).
 
-- **Apple Silicon (M1 and later):** download both
+- **Apple Silicon (M1 and later) - one file:** download
+  [`JournalExplorer-Mac-AppleSilicon.app.zip`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-Mac-AppleSilicon.app.zip),
+  unzip it (double-click, or Finder does it automatically for a downloaded zip) and double-click the `JournalExplorer.app`
+  it makes, like any other Mac app. Same binary as the two-file option below, just wrapped as a real `.app`
+  bundle so there's only one thing to send someone.
+  *(Two-file alternative, if you'd rather not unzip: download both
   [`JournalExplorer-mac`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-mac) and
   [`Start JournalExplorer (Mac Apple Silicon).command`](<https://github.com/alex6296/journal-explorer/raw/main/Start JournalExplorer (Mac Apple Silicon).command>)
-  into the same folder, then double-click the `.command` file.
+  into the same folder and double-click the `.command` file.)*
 - **Intel:** download both
   [`JournalExplorer-mac-intel`](https://github.com/alex6296/journal-explorer/raw/main/JournalExplorer-mac-intel) and
   [`Start JournalExplorer (Mac Intel).command`](<https://github.com/alex6296/journal-explorer/raw/main/Start JournalExplorer (Mac Intel).command>)
